@@ -9,8 +9,11 @@ coverage report that always states its denominator.
   a configurable regex) *and* from JSON collections. Written as JSON only.
 - **Flows**: read from markdown sections (configurable heading regex) *and* from JSON
   collections. Written as JSON only.
+- **Data model**: DynamoDB-style tables (keys, GSIs, entities, attributes, pseudo-relations,
+  access patterns) kept as JSON, queryable and aggregatable — the tool answers "which
+  table / index / repository" instead of the agent rediscovering it from code.
 - **Coverage & validation**: which requirements have a status, a flow, a test, a doc;
-  duplicate / dangling IDs; links to things that do not exist.
+  duplicate / dangling IDs; links to things that do not exist; data-model lint.
 
 Nothing project-specific lives in the code. Every format decision is a config key.
 
@@ -60,6 +63,12 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
     "heading_pattern": "^##\\s+(.+)$",
     "write_file": "docs/flows/flows.json"
   },
+  "datamodel": {
+    "globs": ["docs/datamodel/*.json"],
+    "exclude": ["**/node_modules/**"],
+    "max_gsis_per_table": 3,
+    "write_file": "docs/datamodel/datamodel.json"
+  },
   "links_file": ".spec-links.json",
   "index_file": ".spec-index.json"
 }
@@ -76,6 +85,9 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
 | `flows.globs` | `*.md` files are split into flows by `heading_pattern`; `*.json` files are JSON collections. |
 | `flows.heading_pattern` | Regex matched per line; group 1 (or the heading text) is the flow title, slugified into its id. |
 | `flows.write_file` | JSON collection that `flow_upsert` / `spec_import_markdown` write to. Always indexed. |
+| `datamodel.globs` | JSON files with `{"tables": [...]}` or a bare array (schema below). |
+| `datamodel.max_gsis_per_table` | `dm_validate` flags tables with more GSIs than this. |
+| `datamodel.write_file` | Where `dm_upsert_table` puts a *new* table; existing tables are written back to their owning file. |
 | `links_file` | Sidecar for links on **markdown-sourced** requirements (JSON items carry links inline). |
 | `index_file` | Cache of the parsed collections, fingerprinted by file list + mtimes + size + config. Rebuilt lazily when stale and after every write. Add it to `.gitignore`. |
 
@@ -96,7 +108,15 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
 | `flow_upsert(id, title, steps, requirements, roles, file)` | Create/replace a JSON flow item. Refuses ids defined in markdown. |
 | `spec_import_markdown(collection, glob, target_file, dry_run=True)` | Convert markdown-parsed requirements or flows into the JSON schema (keeps `source.file/line`). `dry_run=False` merges into the target without duplicating ids. |
 | `spec_validate()` | Duplicate IDs, dangling IDs (referenced but undefined, incl. from flows), sidecar links to missing targets. |
-| `spec_index()` | Force rebuild and regenerate `INDEX.md` in every requirements/flows directory. |
+| `spec_index()` | Force rebuild and regenerate `INDEX.md` in every requirements/flows directory and in the data-model directory. |
+| `dm_tables()` | Tables with pk/sk names and counts of GSIs, entities, attributes, relations, access patterns. |
+| `dm_table(name)` | Full record + inbound/outbound pseudo-relations. |
+| `dm_relations(table, entity, format="json"\|"mermaid")` | Edge list, or an `erDiagram` for docs. |
+| `dm_access_patterns(table, index, operation, repository)` | Patterns with the repository method implementing each. |
+| `dm_query(where={table, entity, attribute, index, operation, kind})` | Generic filter → matching tables, attributes, patterns, relations + counts. |
+| `dm_aggregate(by, metric="count")` | Group by table / index / entity / operation / repository / kind; `by="table"` also accepts metric `gsis`, `attributes`, `relations`, `patterns`. |
+| `dm_validate()` | Too many GSIs, `Scan` patterns, unknown index, relation to unknown table/attribute, GSI key missing from `attributes`, repository file missing on disk, duplicate tables. |
+| `dm_upsert_table(table)` / `dm_upsert_pattern(table, pattern)` | Write back to the owning JSON file (pretty, stable order, sorted by name). |
 
 Errors never raise: `{"error": {"category": "not_found|validation|io|config", "message", "retryable"}}`.
 Every list answer says what was scanned, so an empty result is distinguishable from
@@ -161,6 +181,38 @@ Flow item:
 
 `source` is optional; `spec_import_markdown` fills it so a JSON item still points at the
 prose it came from.
+
+### Data model (read + write)
+
+`docs/datamodel/*.json` — `{"tables": [...]}` or a bare array. One table:
+
+```json
+{
+  "name": "companies",
+  "source": "backend/terraform/modules/dynamodb/companies.tf:12",
+  "description": "One row per organization",
+  "pk": { "name": "PK", "type": "S" },
+  "sk": { "name": "SK", "type": "S" },
+  "gsis": [{ "name": "GSI_COMPANY_URL", "pk": "companyUrl", "sk": null, "projection": "ALL", "attributes": [] }],
+  "ttl": "expiresAt",
+  "stream": false,
+  "entities": ["Company"],
+  "attributes": [{ "name": "companyUrl", "type": "S", "required": true, "pii": false, "description": "kebab slug" }],
+  "relations": [{ "from": "locations.companyId", "to": "companies.PK", "kind": "belongs_to", "enforced_by": "code", "note": "tenant scope" }],
+  "access_patterns": [{ "name": "company by url", "operation": "Query", "index": "GSI_COMPANY_URL", "key": "companyUrl = :url", "repository": "src/repos/company.repository.ts:getByUrl", "description": "" }]
+}
+```
+
+`projection` ∈ `ALL | KEYS_ONLY | INCLUDE`; `kind` ∈ `belongs_to | has_many | references`;
+`enforced_by` ∈ `code | none`; `operation` ∈ `Query | GetItem | BatchGet | Put | Update |
+Delete | Transact | Scan`. `relations` are **pseudo-relations**: DynamoDB has no foreign
+keys, these are the links the code relies on, written down once so every agent sees the
+same picture. `repository` is `path:method`; `dm_validate` checks that the path exists.
+
+**Tool over self-discovery.** Reading Terraform, repositories and Lambda handlers to
+re-derive "which index serves this query" costs context every time and drifts between
+agents. Record it once in the data-model collection, ask `dm_*`, and let `dm_validate`
+catch the drift (unknown index, missing repository file, Scan creeping in).
 
 ### Non-destructive by design
 
