@@ -1,6 +1,6 @@
 [project]
 name = "spec-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server for managing project docs, user flows and requirements with coverage and validation"
 readme = "README.md"
 license = "MIT"

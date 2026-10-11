@@ -35,6 +35,19 @@ DEFAULTS: dict[str, Any] = {
         "max_gsis_per_table": 3,
         "write_file": "docs/datamodel/datamodel.json",
     },
+    "components": {
+        "globs": ["front-end/vendor/duotio-ui/src/components/*/*.registry.json"],
+        "exclude": ["**/node_modules/**"],
+        "index_file_globs": ["front-end/vendor/duotio-ui/registry/index.json"],
+        "tokens_css": "front-end/vendor/duotio-ui/src/styles/tokens.css",
+        "expected_files": [".tsx", ".test.tsx", ".e2e.ts", ".stories.tsx", ".md", ".registry.json", "index.ts"],
+    },
+    "designs": {
+        "globs": ["docs/design/views/*.json"],
+        "exclude": ["**/node_modules/**"],
+        "write_dir": "docs/design/views",
+        "messages_file": "front-end/messages/pl.json",
+    },
     "links_file": ".spec-links.json",
     "index_file": ".spec-index.json",
 }

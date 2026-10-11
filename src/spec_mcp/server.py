@@ -22,6 +22,7 @@ from .config import config_path, load_config
 from .errors import SpecError
 from .index import GENERATED_MARKER, SpecIndex
 from . import datamodel as dm
+from . import frontend as fe
 from .jsonstore import merge_items, upsert_item
 from .parse import is_test_evidence, md_flow_to_item, md_requirement_to_item, rel
 
@@ -94,8 +95,8 @@ def spec_config() -> dict[str, Any]:
         "config": cfg,
         "config_file": idx.cfg["_source"],
         "root": idx.cfg["_root"],
-        "counts": {"docs": idx.doc_files, "requirements": len(idx.requirements), "flows": len(idx.flows), "datamodel": len(idx.tables)},
-        "files": {"requirements": idx.req_files, "flows": idx.flow_files, "datamodel": idx.dm_files},
+        "counts": {"docs": idx.doc_files, "requirements": len(idx.requirements), "flows": len(idx.flows), "datamodel": len(idx.tables), "components": len(idx.components), "designs": len(idx.designs)},
+        "files": {"requirements": idx.req_files, "flows": idx.flow_files, "datamodel": idx.dm_files, "components": idx.component_files, "component_index": idx.index_files, "designs": idx.design_files},
         "index_file": str(idx.cache_path),
         "index_age_seconds": idx.age_seconds(),
         "warnings": idx.warnings,
@@ -515,6 +516,11 @@ def spec_index() -> dict[str, Any]:
         p = d / "INDEX.md"
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         written.append(rel(p, idx.root))
+    if idx.designs:
+        d_dir = idx.resolve(idx.design_files[0]).parent if idx.design_files else idx.resolve(idx.cfg["designs"]["write_dir"])
+        p = d_dir / "INDEX.md"
+        p.write_text(fe.render_design_index(list(idx.designs.values()), GENERATED_MARKER), encoding="utf-8")
+        written.append(rel(p, idx.root))
     if idx.tables:
         dm_dir = idx.resolve(idx.cfg["datamodel"]["write_file"]).parent
         if idx.dm_files:
@@ -524,7 +530,7 @@ def spec_index() -> dict[str, Any]:
         written.append(rel(p, idx.root))
     idx.invalidate()
     idx.ensure(force=True)
-    return {"requirements": len(idx.requirements), "flows": len(idx.flows), "docs": idx.doc_files, "datamodel": len(idx.tables), "written": written}
+    return {"requirements": len(idx.requirements), "flows": len(idx.flows), "docs": idx.doc_files, "datamodel": len(idx.tables), "components": len(idx.components), "designs": len(idx.designs), "written": written}
 
 
 # ---------------------------------------------------------------- data model
@@ -789,6 +795,196 @@ def dm_upsert_pattern(table: str, pattern: dict[str, Any]) -> dict[str, Any]:
     idx.invalidate()
     idx.ensure(force=True)
     return {"action": action, "table": table, "pattern": pattern["name"], "file": rel(path, idx.root)}
+
+
+# ---------------------------------------------------------------- UI components
+
+
+def _ui_patterns(idx: SpecIndex) -> list[str]:
+    return list(idx.cfg["components"].get("expected_files") or [])
+
+
+@_tool
+def ui_components(category: str | None = None, limit: int = 200) -> dict[str, Any]:
+    """List registered UI components: name, category, import line, number of props and
+    how many of the expected companion files (tsx, test, e2e, stories, md, registry,
+    index) exist on disk. Ask this before writing a new component."""
+    idx = _idx()
+    pats = _ui_patterns(idx)
+    items = []
+    for c in sorted(idx.components.values(), key=lambda x: x["name"]):
+        if category and c["category"] != category:
+            continue
+        pres = fe.file_presence(c, pats, idx.root)
+        items.append({
+            "name": c["name"], "category": c["category"], "import": c["import"], "props": len(c["props"]),
+            "files": {"present": sum(pres.values()), "expected": len(pres)}, "file": c["file"],
+        })
+    return {"items": items[: max(1, limit)], "total": len(items), "scanned_files": len(idx.component_files)}
+
+
+@_tool
+def ui_component(name: str) -> dict[str, Any]:
+    """Full registry record of one component (props, variants, tokensUsed, a11y, examples,
+    dependsOn) plus which expected files exist on disk, the missing ones, and the path of
+    its markdown doc when present."""
+    idx = _idx()
+    c = idx.components.get(name)
+    if c is None:
+        raise SpecError("not_found", f"component {name!r} not found", available=sorted(idx.components)[:80])
+    pres = fe.file_presence(c, _ui_patterns(idx), idx.root)
+    md = f"{c['dir']}/{c['name']}.md"
+    return {
+        "component": c,
+        "files": pres,
+        "missing": [f for f, ok in pres.items() if not ok],
+        "md": md if (idx.root / md).is_file() else None,
+    }
+
+
+@_tool
+def ui_find(query: str, limit: int = 10) -> dict[str, Any]:
+    """"Is there already a component for X?" — BM25 over component names, descriptions,
+    categories, prop names/descriptions and example titles. Returns ranked hits with the
+    import line, and how many components were searched."""
+    idx = _idx()
+    from .bm25 import BM25
+
+    comps = sorted(idx.components.values(), key=lambda x: x["name"])
+    engine = BM25([tokenize(fe.component_text(c)) for c in comps])
+    hits = []
+    for i, score in engine.search(tokenize(query), limit=max(1, min(limit, 50))):
+        c = comps[i]
+        hits.append({"name": c["name"], "category": c["category"], "import": c["import"], "score": round(score, 3), "description": c["description"][:200]})
+    return {"query": query, "hits": hits, "searched": len(comps)}
+
+
+@_tool
+def ui_validate() -> dict[str, Any]:
+    """Registry lint: expected companion files missing on disk, tokensUsed not defined as
+    --token in tokens_css, components on disk missing from registry/index.json and index
+    entries with no registry file, dependsOn naming unknown components."""
+    idx = _idx()
+    pats = _ui_patterns(idx)
+    findings = fe.validate_components(idx.components, idx.index_names, idx.tokens, pats, idx.root)
+    return {
+        "findings": findings,
+        "total": len(findings),
+        "checked": {"components": len(idx.components), "index_entries": len(idx.index_names), "tokens": len(idx.tokens), "expected_files": len(idx.components) * len(pats)},
+    }
+
+
+_UI_BY = ("category", "token", "dependsOn")
+
+
+@_tool
+def ui_aggregate(by: str) -> dict[str, Any]:
+    """Count components by category, by design token used, or by dependency."""
+    idx = _idx()
+    if by not in _UI_BY:
+        raise SpecError("validation", f"by must be one of {list(_UI_BY)}")
+    buckets: dict[str, int] = {}
+    for c in idx.components.values():
+        keys = [c["category"] or "(none)"] if by == "category" else (c["tokensUsed"] if by == "token" else c["dependsOn"])
+        for k in keys:
+            buckets[k] = buckets.get(k, 0) + 1
+    return {"by": by, "buckets": dict(sorted(buckets.items())), "denominator": {"components": len(idx.components)}}
+
+
+# ---------------------------------------------------------------- designs
+
+
+@_tool
+def design_list(status: str | None = None) -> dict[str, Any]:
+    """List design records (one per view): id, title, route, status, roles, counts of
+    components/artboards/requirements, artifact_url."""
+    idx = _idx()
+    if status and status not in fe.STATUSES:
+        raise SpecError("validation", f"status must be one of {list(fe.STATUSES)}")
+    items = []
+    for d in sorted(idx.designs.values(), key=lambda x: x["id"]):
+        if status and d["status"] != status:
+            continue
+        items.append({
+            "id": d["id"], "title": d["title"], "route": d["route"], "status": d["status"], "roles": d["roles"],
+            "components": len(d["components"]), "artboards": len(d["artboards"]), "requirements": len(d["requirements"]),
+            "artifact_url": d["artifact_url"], "file": d["file"],
+        })
+    return {"items": items, "total": len(items), "scanned_files": len(idx.design_files)}
+
+
+@_tool
+def design_get(id: str) -> dict[str, Any]:
+    """Full design record of one view."""
+    idx = _idx()
+    d = idx.designs.get(id)
+    if d is None:
+        raise SpecError("not_found", f"design {id!r} not found", available=sorted(idx.designs)[:80])
+    return {"design": d, "file": d["file"]}
+
+
+@_tool
+def design_upsert(record: dict[str, Any]) -> dict[str, Any]:
+    """Create or update a design record, merged by id over the existing file
+    (designs.write_dir/<id>.json), written as pretty JSON with a stable key order.
+    `status` must be brief | designed | specified | implemented | verified."""
+    idx = _idx()
+    if not isinstance(record, dict) or not record.get("id"):
+        raise SpecError("validation", "record.id is required")
+    did = str(record["id"])
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", did):
+        raise SpecError("validation", "id must be a kebab-case slug (a-z, 0-9, '-')")
+    if "status" in record and record["status"] not in fe.STATUSES:
+        raise SpecError("validation", f"status must be one of {list(fe.STATUSES)}")
+    existing = idx.designs.get(did)
+    path = idx.resolve(existing["file"]) if existing else idx.resolve(idx.cfg["designs"]["write_dir"]) / f"{did}.json"
+    base = {k: v for k, v in (existing or {}).items() if k != "file"}
+    merged = {**base, **record}
+    fe.write_design(path, merged)
+    idx.invalidate()
+    idx.ensure(force=True)
+    return {"action": "updated" if existing else "created", "id": did, "file": rel(path, idx.root), "status": merged.get("status", "brief")}
+
+
+@_tool
+def design_validate(id: str | None = None) -> dict[str, Any]:
+    """Design lint: duotio-ui components missing from the registry; feature/new-duotio-ui
+    components without a path; unknown requirement ids; missing artifact_url and missing
+    390 light+dark artboards once status >= designed; empty acceptance once >= specified;
+    i18n_keys absent from messages_file once >= implemented."""
+    idx = _idx()
+    designs = list(idx.designs.values())
+    if id is not None:
+        if id not in idx.designs:
+            raise SpecError("not_found", f"design {id!r} not found", available=sorted(idx.designs)[:80])
+        designs = [idx.designs[id]]
+    messages = fe.load_messages(idx.resolve(idx.cfg["designs"]["messages_file"]))
+    findings = fe.validate_designs(designs, idx.components, set(idx.requirements), messages)
+    return {
+        "findings": findings,
+        "total": len(findings),
+        "checked": {"designs": len(designs), "components": len(idx.components), "requirements": len(idx.requirements), "messages_loaded": messages is not None},
+    }
+
+
+@_tool
+def design_coverage() -> dict[str, Any]:
+    """Counts of design records per status and of design components by source
+    (duotio-ui / feature / new-duotio-ui), with denominators."""
+    idx = _idx()
+    by_status = {s: 0 for s in fe.STATUSES}
+    by_source: dict[str, int] = {}
+    n_comp = 0
+    for d in idx.designs.values():
+        by_status[d["status"]] = by_status.get(d["status"], 0) + 1
+        for c in d["components"]:
+            n_comp += 1
+            by_source[c["source"]] = by_source.get(c["source"], 0) + 1
+    return {
+        "by_status": by_status,
+        "components_by_source": dict(sorted(by_source.items())),
+        "denominator": {"designs": len(idx.designs), "design_components": n_comp, "registry_components": len(idx.components)},
+    }
 
 
 def main() -> None:
