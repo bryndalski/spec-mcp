@@ -48,6 +48,7 @@ class SpecIndex:
         self.req_files: list[str] = []
         self.flow_files: list[str] = []
         self.fingerprint = ""
+        self.warnings: list[dict[str, Any]] = []
         self._bm25: BM25 | None = None
         self.built_at: float | None = None
 
@@ -73,12 +74,12 @@ class SpecIndex:
 
     def collection_files(self) -> dict[str, list[Path]]:
         docs = self._expand(self.cfg["docs"]["globs"], self.cfg["docs"].get("exclude") or [])
-        reqs = self._expand(self.cfg["requirements"]["globs"])
+        reqs = self._expand(self.cfg["requirements"]["globs"], self.cfg["requirements"].get("exclude") or [])
         wf = self.resolve(self.cfg["requirements"]["write_file"])
         if wf.is_file() and wf not in reqs:
             reqs.append(wf)
         reqs = [p for p in reqs if p.suffix == ".json" or not _is_generated(p)]
-        flows = self._expand(self.cfg["flows"]["globs"])
+        flows = self._expand(self.cfg["flows"]["globs"], self.cfg["flows"].get("exclude") or [])
         fw = self.resolve(self.cfg["flows"]["write_file"])
         if fw.is_file() and fw not in flows:
             flows.append(fw)
@@ -134,13 +135,15 @@ class SpecIndex:
         self.doc_files = len(self.doc_list)
         self.req_files = data["req_files"]
         self.flow_files = data["flow_files"]
+        self.warnings = data.get("warnings", [])
         self._bm25 = None
 
     def _build(self, files: dict[str, list[Path]], fp: str) -> None:
         self.req_all = []
+        self.warnings = []
         for p in files["requirements"]:
             if p.suffix == ".json":
-                self.req_all.extend(parse_requirements_json(p, self.id_re, self.root))
+                self.req_all.extend(parse_requirements_json(p, self.id_re, self.root, self.warnings))
             else:
                 self.req_all.extend(parse_requirements(p, self.id_re, self.status_re, self.root))
         self.requirements = {}
@@ -148,7 +151,7 @@ class SpecIndex:
             self.requirements.setdefault(r["id"], r)
         self.flows = {}
         for p in files["flows"]:
-            parsed = parse_flows_json(p, self.id_re, self.root) if p.suffix == ".json" else parse_flows(p, self.heading_re, self.id_re, self.root)
+            parsed = parse_flows_json(p, self.id_re, self.root, self.warnings) if p.suffix == ".json" else parse_flows(p, self.heading_re, self.id_re, self.root)
             for f in parsed:
                 self.flows.setdefault(f["id"], f)
         self.chunks = []
@@ -175,6 +178,7 @@ class SpecIndex:
             "chunks": self.chunks,
             "docs": self.doc_list,
             "req_files": self.req_files,
+            "warnings": self.warnings,
             "flow_files": self.flow_files,
         }
         try:

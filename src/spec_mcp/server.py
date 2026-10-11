@@ -97,6 +97,7 @@ def spec_config() -> dict[str, Any]:
         "files": {"requirements": idx.req_files, "flows": idx.flow_files},
         "index_file": str(idx.cache_path),
         "index_age_seconds": idx.age_seconds(),
+        "warnings": idx.warnings,
     }
 
 

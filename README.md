@@ -49,12 +49,14 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
   },
   "requirements": {
     "globs": ["docs/requirements/**/*.md", "docs/requirements/**/*.json"],
+    "exclude": ["**/node_modules/**"],
     "id_pattern": "\\b[A-Z][A-Z0-9]{1,7}-R?\\d{1,4}\\b",
     "status_pattern": "\\b(TODO|IN PROGRESS|DONE|BLOCKED|DEPRECATED)\\b",
     "write_file": "docs/requirements/requirements.json"
   },
   "flows": {
     "globs": ["docs/flows/**/*.md", "docs/flows/**/*.json"],
+    "exclude": ["**/node_modules/**"],
     "heading_pattern": "^##\\s+(.+)$",
     "write_file": "docs/flows/flows.json"
   },
@@ -66,6 +68,7 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
 | Key | Meaning |
 |---|---|
 | `docs.globs` / `docs.exclude` | Markdown files to index for `docs_*`. Globs may be absolute. |
+| `*.exclude` | Every collection (`docs`, `requirements`, `flows`) takes an `exclude` list of globs, matched against the absolute and the project-relative path. Default: `["**/node_modules/**"]`. |
 | `requirements.globs` | `*.md` files are parsed read-only; `*.json` files are JSON collections. |
 | `requirements.id_pattern` | Regex for requirement IDs (e.g. `ACT-R1`, `REQ-042`). A line with a match *is* a requirement; the first match is its ID, further matches are `refs`. |
 | `requirements.status_pattern` | Regex (first group = status) searched on the same line. |
@@ -120,7 +123,9 @@ numbered list; requirement IDs anywhere in the section.
 
 ### JSON collections (read + write)
 
-`{"items": [...]}` or a bare array. Written files are pretty-printed with 2-space indent,
+`{"items": [...]}` or a bare array. A JSON file in scope that has any other shape (or
+is not valid JSON) is skipped and reported under `spec_config().warnings` with
+`category: "config"` — it never aborts indexing. Written files are pretty-printed with 2-space indent,
 fixed key order, items sorted by `id` — so diffs stay small and `jq`/prettier-friendly.
 
 Requirement item:

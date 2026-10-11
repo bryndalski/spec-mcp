@@ -18,12 +18,14 @@ DEFAULTS: dict[str, Any] = {
     "docs": {"globs": ["docs/**/*.md"], "exclude": ["**/node_modules/**"]},
     "requirements": {
         "globs": ["docs/requirements/**/*.md", "docs/requirements/**/*.json"],
+        "exclude": ["**/node_modules/**"],
         "id_pattern": r"\b[A-Z][A-Z0-9]{1,7}-R?\d{1,4}\b",
         "status_pattern": r"\b(TODO|IN PROGRESS|DONE|BLOCKED|DEPRECATED)\b",
         "write_file": "docs/requirements/requirements.json",
     },
     "flows": {
         "globs": ["docs/flows/**/*.md", "docs/flows/**/*.json"],
+        "exclude": ["**/node_modules/**"],
         "heading_pattern": r"^##\s+(.+)$",
         "write_file": "docs/flows/flows.json",
     },

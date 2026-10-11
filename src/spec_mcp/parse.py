@@ -331,14 +331,28 @@ def norm_links(v: Any) -> dict[str, list[str]]:
     return out
 
 
-def load_json_items(path: Path) -> list[dict[str, Any]]:
-    """A JSON collection file is {"items": [...]} or a bare array. Non-dict items are skipped."""
+def load_json_items(path: Path, warnings: list[dict[str, Any]] | None = None, root: Path | None = None) -> list[dict[str, Any]]:
+    """A JSON collection file is {"items": [...]} or a bare array. Non-dict items are skipped.
+    A file of any other shape (or invalid JSON) yields no items and a `config` warning."""
     import json
 
-    data = json.loads(path.read_text(encoding="utf-8"))
-    items = data.get("items", []) if isinstance(data, dict) else data
-    if not isinstance(items, list):
+    def warn(msg: str) -> list[dict[str, Any]]:
+        if warnings is not None:
+            warnings.append({"category": "config", "file": rel(path, root) if root else str(path), "message": msg})
         return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return warn(f"skipped: invalid JSON ({e})")
+    if isinstance(data, dict):
+        if "items" not in data:
+            return warn('skipped: JSON object without an "items" array (expected {"items": [...]} or a bare array)')
+        items = data["items"]
+    else:
+        items = data
+    if not isinstance(items, list):
+        return warn('skipped: "items" is not an array (expected {"items": [...]} or a bare array)')
     return [i for i in items if isinstance(i, dict) and i.get("id")]
 
 
@@ -399,14 +413,14 @@ def norm_flow(item: dict[str, Any], *, file: str, id_re: re.Pattern[str]) -> dic
     }
 
 
-def parse_requirements_json(path: Path, id_re: re.Pattern[str], root: Path) -> list[dict[str, Any]]:
+def parse_requirements_json(path: Path, id_re: re.Pattern[str], root: Path, warnings: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     file = rel(path, root)
-    return [norm_requirement(i, file=file, domain_default=path.stem, id_re=id_re) for i in load_json_items(path)]
+    return [norm_requirement(i, file=file, domain_default=path.stem, id_re=id_re) for i in load_json_items(path, warnings, root)]
 
 
-def parse_flows_json(path: Path, id_re: re.Pattern[str], root: Path) -> list[dict[str, Any]]:
+def parse_flows_json(path: Path, id_re: re.Pattern[str], root: Path, warnings: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     file = rel(path, root)
-    return [norm_flow(i, file=file, id_re=id_re) for i in load_json_items(path)]
+    return [norm_flow(i, file=file, id_re=id_re) for i in load_json_items(path, warnings, root)]
 
 
 def md_requirement_to_item(r: dict[str, Any], links: dict[str, list[str]] | None = None) -> dict[str, Any]:
