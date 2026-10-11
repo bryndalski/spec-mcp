@@ -6,7 +6,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 authors = [{ name = "Jakub Bryndal" }]
-dependencies = ["mcp>=1.2.0"]
+dependencies = ["mcp>=2,<3"]
 
 [project.scripts]
 spec-mcp = "spec_mcp.server:main"
