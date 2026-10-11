@@ -30,7 +30,8 @@ DESIGN_KEYS = (
     "decisions",
     "evidence",
 )
-_TOKEN_DEF = re.compile(r"^\s*(--[A-Za-z][A-Za-z0-9_-]*)\s*:", re.MULTILINE)
+_TOKEN_DEF = re.compile(r"(--[A-Za-z0-9][A-Za-z0-9_-]*)\s*:")
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _PASCAL = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 
 
@@ -100,11 +101,12 @@ def load_index_names(
 
 
 def load_tokens(path: Path) -> list[str]:
+    """Every `--name:` declaration in the file — several per line, inside any block
+    (:root, .dark, media queries) — with /* … */ comments stripped first."""
     if not path.is_file():
         return []
-    return sorted(
-        set(_TOKEN_DEF.findall(path.read_text(encoding="utf-8", errors="replace")))
-    )
+    css = _CSS_COMMENT.sub(" ", path.read_text(encoding="utf-8", errors="replace"))
+    return sorted(set(_TOKEN_DEF.findall(css)))
 
 
 def expected_files(comp: dict[str, Any], patterns: list[str]) -> list[str]:
