@@ -12,6 +12,10 @@ coverage report that always states its denominator.
 - **Data model**: DynamoDB-style tables (keys, GSIs, entities, attributes, pseudo-relations,
   access patterns) kept as JSON, queryable and aggregatable — the tool answers "which
   table / index / repository" instead of the agent rediscovering it from code.
+- **UI components**: a per-component registry (`*.registry.json`) made searchable —
+  "is there already a component for X?" — and linted against disk, tokens and the index.
+- **Designs**: one JSON record per view (route, roles, flow, requirements, artboards,
+  brief, components, acceptance, evidence) with status gates checked by `design_validate`.
 - **Coverage & validation**: which requirements have a status, a flow, a test, a doc;
   duplicate / dangling IDs; links to things that do not exist; data-model lint.
 
@@ -69,6 +73,19 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
     "max_gsis_per_table": 3,
     "write_file": "docs/datamodel/datamodel.json"
   },
+  "components": {
+    "globs": ["front-end/vendor/duotio-ui/src/components/*/*.registry.json"],
+    "exclude": ["**/node_modules/**"],
+    "index_file_globs": ["front-end/vendor/duotio-ui/registry/index.json"],
+    "tokens_css": "front-end/vendor/duotio-ui/src/styles/tokens.css",
+    "expected_files": [".tsx", ".test.tsx", ".e2e.ts", ".stories.tsx", ".md", ".registry.json", "index.ts"]
+  },
+  "designs": {
+    "globs": ["docs/design/views/*.json"],
+    "exclude": ["**/node_modules/**"],
+    "write_dir": "docs/design/views",
+    "messages_file": "front-end/messages/pl.json"
+  },
   "links_file": ".spec-links.json",
   "index_file": ".spec-index.json"
 }
@@ -88,6 +105,12 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
 | `datamodel.globs` | JSON files with `{"tables": [...]}` or a bare array (schema below). |
 | `datamodel.max_gsis_per_table` | `dm_validate` flags tables with more GSIs than this. |
 | `datamodel.write_file` | Where `dm_upsert_table` puts a *new* table; existing tables are written back to their owning file. |
+| `components.globs` | One registry JSON per component (`{name, import, description, category, props[], variants, tokensUsed[], a11y, examples[], dependsOn[]}`); the component directory is the registry file's parent. |
+| `components.index_file_globs` | Library index (`{"$meta": {...}, "components": [{name, ...}]}`) checked both ways against the registry files. |
+| `components.tokens_css` | CSS file whose `--token:` definitions `tokensUsed` must come from. |
+| `components.expected_files` | Companion files per component; a leading `.` means `<Name><suffix>`, otherwise a literal file name. |
+| `designs.globs` / `designs.write_dir` | One record per view, `docs/design/views/<id>.json`; `design_upsert` writes here. |
+| `designs.messages_file` | i18n JSON used for dot-path lookup of `i18n_keys` once a design is `implemented`. |
 | `links_file` | Sidecar for links on **markdown-sourced** requirements (JSON items carry links inline). |
 | `index_file` | Cache of the parsed collections, fingerprinted by file list + mtimes + size + config. Rebuilt lazily when stale and after every write. Add it to `.gitignore`. |
 
@@ -117,6 +140,15 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
 | `dm_aggregate(by, metric="count")` | Group by table / index / entity / operation / repository / kind; `by="table"` also accepts metric `gsis`, `attributes`, `relations`, `patterns`. |
 | `dm_validate()` | Too many GSIs, `Scan` patterns, unknown index, relation to unknown table/attribute, GSI key missing from `attributes`, repository file missing on disk, duplicate tables. |
 | `dm_upsert_table(table)` / `dm_upsert_pattern(table, pattern)` | Write back to the owning JSON file (pretty, stable order, sorted by name). |
+| `ui_components(category, limit)` | Components with category, import line, prop count and present/expected companion files. |
+| `ui_component(name)` | Full registry record + which expected files exist, the missing ones, and the `.md` doc path. |
+| `ui_find(query, limit)` | BM25 over name / description / category / prop names+desc / example titles — "is there already a component for X?". |
+| `ui_validate()` | Missing companion files, `tokensUsed` not defined in `tokens_css`, components not in the index / index entries not on disk, `dependsOn` naming unknown (PascalCase) components. |
+| `ui_aggregate(by="category"\|"token"\|"dependsOn")` | Counts per bucket. |
+| `design_list(status)` / `design_get(id)` | Design records; `status` ∈ brief, designed, specified, implemented, verified. |
+| `design_upsert(record)` | Merge by id into `write_dir/<id>.json` (pretty, stable key order). |
+| `design_validate(id=None)` | duotio-ui component not in registry; feature/new-duotio-ui without `path`; unknown requirement ids; ≥ designed: `artifact_url` and 390 light+dark artboards required; ≥ specified: non-empty `acceptance`; ≥ implemented: every `i18n_keys` entry resolvable in `messages_file`. |
+| `design_coverage()` | Records per status, components by source, denominators. |
 
 Errors never raise: `{"error": {"category": "not_found|validation|io|config", "message", "retryable"}}`.
 Every list answer says what was scanned, so an empty result is distinguishable from
@@ -213,6 +245,26 @@ same picture. `repository` is `path:method`; `dm_validate` checks that the path 
 re-derive "which index serves this query" costs context every time and drifts between
 agents. Record it once in the data-model collection, ask `dm_*`, and let `dm_validate`
 catch the drift (unknown index, missing repository file, Scan creeping in).
+
+### Design record (read + write)
+
+`docs/design/views/<id>.json`:
+
+```json
+{
+  "id": "schedule-week", "title": "Week schedule", "route": "/app/[slug]/schedule",
+  "roles": ["manager"], "flow": "3-from-schedule-to-publish", "requirements": ["SCH-R1"],
+  "status": "designed", "artifact_url": "https://claude.ai/artifact/…",
+  "artboards": [{ "name": "default", "viewport": 390, "theme": "light", "url": "…" }],
+  "brief": { "goal": "…", "primary_action": "Publish", "style": "calm paper", "decoration_budget": 1, "references": [] },
+  "components": [{ "name": "AlertBanner", "source": "duotio-ui", "path": "", "props": ["variant"], "states": ["info"], "i18n_keys": ["schedule.title"], "tests": [] }],
+  "acceptance": [], "decisions": [], "evidence": []
+}
+```
+
+`viewport` ∈ 320 | 390 | 1440; `theme` ∈ light | dark; component `source` ∈ `duotio-ui`
+(must exist in the registry) | `feature` | `new-duotio-ui` (both need `path`). Status is a
+ratchet: each step adds checks that `design_validate` enforces.
 
 ### Non-destructive by design
 
