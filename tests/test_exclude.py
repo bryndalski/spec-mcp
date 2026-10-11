@@ -40,7 +40,7 @@ def svc(project: Path, monkeypatch):
 
 def test_exclude_applies_to_requirements_and_flows(svc):
     out = server.spec_config()
-    assert out["counts"] == {"docs": 6, "requirements": 5, "flows": 2}
+    assert out["counts"] == {"docs": 6, "requirements": 5, "flows": 2, "datamodel": 0}
     assert "docs/requirements/jira-mapping.json" not in out["files"]["requirements"]
     assert (
         "docs/requirements/domains/DRAFT-ignored.md" not in out["files"]["requirements"]
