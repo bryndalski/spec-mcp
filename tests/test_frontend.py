@@ -407,7 +407,7 @@ def test_spec_index_writes_design_index(svc: Path):
 
 def test_frontend_tools_registered():
     names = set(server.mcp._tool_manager._tools)  # noqa: SLF001
-    assert len(names) == 34
+    assert len(names) == 40
     assert {
         "ui_components",
         "ui_component",
