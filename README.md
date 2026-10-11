@@ -97,6 +97,13 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
 | Key | Meaning |
 |---|---|
 | `docs.globs` / `docs.exclude` | Markdown files to index for `docs_*`. Globs may be absolute. |
+| `docs.statuses` / `docs.default_hidden_statuses` | Allowed front-matter statuses (default `current, superseded, historical, draft`) and the ones `docs_search` / `docs_list` hide unless asked (default `superseded, historical`). |
+| `docs.require_front_matter` | `true`: a file without `status` is `unknown` (never hidden, flagged by `docs_check`). `false` (default): it counts as `current`. |
+| `docs.archive_dir` | Where `docs_supersede` moves retired files (default `docs/archive`). |
+| `docs.stale_patterns` | `[{id, regex, reason, flags: "i", exclude_statuses: [...]}]` — lines matching are reported by `docs_check` (files with an excluded status are skipped). |
+| `docs.evidence_roots` | Directories (relative to the project root) that `flow_verify` / `req_verify` resolve `path:line` evidence against. Empty = the project root. |
+| `docs.max_chunk_chars` | Soft size limit of one search chunk (default 1200); longer sections split on paragraphs. |
+| `flows.require_screen_role` | `true`: `spec_validate` warns for JSON flow steps with an empty `screen` or `role`. |
 | `*.exclude` | Every collection (`docs`, `requirements`, `flows`) takes an `exclude` list of globs, matched against the absolute and the project-relative path. Default: `["**/node_modules/**"]`. |
 | `requirements.globs` | `*.md` files are parsed read-only; `*.json` files are JSON collections. |
 | `requirements.id_pattern` | Regex for requirement IDs (e.g. `ACT-R1`, `REQ-042`). A line with a match *is* a requirement; the first match is its ID, further matches are `refs`. |
@@ -122,9 +129,14 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
 | Tool | What it does |
 |---|---|
 | `spec_config()` | Effective config, counts per collection, index age. |
-| `docs_search(query, limit=10, glob=None)` | BM25 over heading chunks → `file, heading, line, score, snippet` + `searched_chunks`, `searched_files`. |
-| `docs_get(path, heading=None)` | Whole file or one section with its line range. |
-| `docs_list(glob=None, limit=200)` | Files with title (first H1) and size + `total`. |
+| `docs_search(query, limit=10, glob=None, status=None, topic=None, include_stale=False)` | BM25 over heading chunks → `file, heading, path (breadcrumb), line, status, score, snippet` + `searched_chunks`, `searched_files`, `hidden_files`. Superseded/historical files are hidden unless `include_stale` or an explicit `status`. |
+| `docs_get(path, heading=None)` | Whole file or one whole section (even if split into chunks) with its line range and status. |
+| `docs_list(glob=None, limit=200, status=None, topic=None, include_stale=False)` | Files with title, size, status, topic + `total`, `hidden_count`. |
+| `docs_check(glob=None, checks=None, limit=500)` | Read-only hygiene audit: `no_status`, `unknown_status`, `superseded_without_target`, `superseded_by_missing`, `supersedes_missing`, `historical_outside_archive`, `dead_link`, `dead_anchor`, `unresolved_path`, `stale_pattern`. Returns `checked`, `by_status`, `counts_by_rule`, `findings`. |
+| `docs_upsert(path, front_matter=None, body=None)` | Write front matter (validated: status, ISO `verified_at`) and optionally the body; path must be in `docs.globs`. |
+| `docs_supersede(path, by, reason, move_to_archive=True, dry_run=False)` | Mark `superseded`, add the banner, `git mv` into `docs.archive_dir/<topic or first dir>/`. Refuses when `by` does not exist. |
+| `flow_verify(id=None, fix=False, include_ok=False, limit=200)` | Check step/async evidence and anchors of JSON flows against the code (see *Verification*). |
+| `req_verify(domain=None, fix=False, include_ok=False, limit=200)` | Same for JSON requirements (`text`, `acceptance`, `evidence[]`, `anchors`). |
 | `req_list(domain, status, with_flow, with_test, limit)` | Filtered requirements + `total`. |
 | `req_get(id)` | One requirement: refs, evidence, effective links, flows mentioning it, duplicate definitions. |
 | `req_upsert(id, text, status, domain, file, title, tags, acceptance)` | Create/update a JSON item (see schema). Refuses IDs defined in another file. |
@@ -303,6 +315,48 @@ server's. When `globs` match several files, `write_file` is the default append t
 `rec_upsert(..., file=...)` picks another (a new path is created). `spec_index` writes an
 `INDEX.md` into every directory holding records: one section per collection with the
 status distribution when records carry a `status` field.
+
+### Document status
+
+A markdown document may start with YAML front matter:
+
+```yaml
+---
+status: current        # current | superseded | historical | draft (configurable)
+topic: hosting
+owner: platform
+supersedes:
+  - docs/OLD.md
+superseded_by: docs/NEW.md
+verified_at: 2026-10-11
+title: Optional override of the first H1
+---
+```
+
+`docs_search` / `docs_list` hide `docs.default_hidden_statuses` by default and report how many
+files they hid, so retired documents stay in the repo (and in `docs/archive/`) without
+polluting answers. `docs_check` audits the corpus; `docs_supersede` retires a document and moves
+it to the archive with `git mv` (plain rename outside git).
+
+### Verification
+
+`flow_verify` and `req_verify` answer "does the evidence still point at the code?". A reference
+is `path:line[-line]` (flow `evidence`, requirement `text`) and may be sharpened with
+`anchors: [{file, symbol, line}]` on a flow step or requirement. Paths are resolved under
+`docs.evidence_roots` (bare file names and path suffixes are looked up there). Statuses:
+
+| Status | Meaning |
+|---|---|
+| `ok` | File found, line in range, symbol (if any) within ±5 lines of `line`. Without a symbol only file and range are checked (`unanchored_ok`). |
+| `moved` | Symbol exists elsewhere in the file (`new_line` = nearest). `fix=true` rewrites the reference and the anchor line, shifting a range as a whole. |
+| `symbol_missing` / `file_missing` / `line_out_of_range` | Evidence is broken. |
+| `ambiguous` | Several candidate files (`candidates`), e.g. the same relative path under two roots. |
+| `wrong_root` | The path exists but outside every evidence root (e.g. a decommissioned tree). |
+| `invalid_anchor` | Anchor without `file`. |
+
+Flows may also carry a flow-level `async: [{n, runtime, action, evidence}]` list
+(`runtime` ∈ `nest|lambda|stepfn|sns|sqs|eventbridge`) for work that happens outside the
+request; its evidence is verified too. Markdown flows and requirements are skipped.
 
 ### Non-destructive by design
 

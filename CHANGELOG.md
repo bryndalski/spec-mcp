@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0 — 2026-10-11
+
+- **Document status**: front matter (`status`, `topic`, `owner`, `supersedes`, `superseded_by`,
+  `verified_at`, `title`). `docs_search` / `docs_list` gain `status`, `topic`, `include_stale`;
+  superseded and historical files are hidden by default and counted in `hidden_files`.
+- **Chunking**: heading breadcrumb (`path`), soft size limit (`docs.max_chunk_chars`, split on
+  paragraphs), front matter skipped; `docs_get(heading)` still returns the whole section.
+- **New tools** (40 → 45): `docs_check`, `docs_upsert`, `docs_supersede`, `flow_verify`,
+  `req_verify`.
+- Evidence anchors (`anchors: [{file, symbol, line}]`) on flow steps and requirements; flow-level
+  `async` list; `flows.require_screen_role` makes `spec_validate` warn on empty `screen`/`role`.
+- `flow_upsert` accepts anchors on steps and `async_steps`.
+- Config: `docs.statuses`, `default_hidden_statuses`, `archive_dir`, `require_front_matter`,
+  `stale_patterns`, `evidence_roots`, `max_chunk_chars` (validated at load).
+- Index cache version 4 (rebuilds once).
+
 ## 0.4.0 — 2026-10-11
 
 - **Records**: generic, schema-validated JSON collections configured under `records.<name>`

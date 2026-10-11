@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .errors import SpecError
-from .parse import FLOW_KEYS, REQ_KEYS, STEP_KEYS, empty_links, norm_links
+from .parse import ASYNC_KEYS, FLOW_KEYS, REQ_KEYS, STEP_KEYS, empty_links, norm_anchors, norm_async, norm_links
 
 
 def _ordered(item: dict[str, Any], keys: Sequence[str]) -> dict[str, Any]:
@@ -33,6 +33,8 @@ def clean_requirement(item: dict[str, Any]) -> dict[str, Any]:
         "acceptance": [str(a) for a in (item.get("acceptance") or [])],
         "links": norm_links(item.get("links")) if item.get("links") else empty_links(),
     }
+    if item.get("anchors"):
+        it["anchors"] = norm_anchors(item["anchors"])
     if isinstance(item.get("source"), dict):
         it["source"] = {"file": item["source"].get("file"), "line": item["source"].get("line")}
     for k, v in item.items():
@@ -45,9 +47,15 @@ def clean_flow(item: dict[str, Any]) -> dict[str, Any]:
     steps = []
     for n, s in enumerate(item.get("steps") or [], start=1):
         s = s if isinstance(s, dict) else {"action": str(s)}
-        st = {k: str(s.get(k, "") or "") for k in STEP_KEYS}
+        st: dict[str, Any] = {k: str(s.get(k, "") or "") for k in STEP_KEYS}
         st["n"] = st["n"] or str(n)
-        steps.append(_ordered(st, STEP_KEYS))
+        anchors = norm_anchors(s.get("anchors"))
+        if anchors:
+            st["anchors"] = anchors
+        for k, v in s.items():  # unknown step keys survive a round trip
+            if k not in st and k not in STEP_KEYS and k != "anchors":
+                st[k] = v
+        steps.append(_ordered(st, (*STEP_KEYS, "anchors")))
     it = {
         "id": str(item["id"]),
         "title": str(item.get("title") or item["id"]),
@@ -55,6 +63,8 @@ def clean_flow(item: dict[str, Any]) -> dict[str, Any]:
         "requirements": [str(r) for r in (item.get("requirements") or [])],
         "steps": steps,
     }
+    if item.get("async"):
+        it["async"] = [_ordered(a, ASYNC_KEYS) for a in norm_async(item["async"])]
     if isinstance(item.get("source"), dict):
         it["source"] = {"file": item["source"].get("file"), "line": item["source"].get("line")}
     for k, v in item.items():

@@ -24,16 +24,21 @@ from .index import GENERATED_MARKER, SpecIndex
 from . import datamodel as dm
 from . import frontend as fe
 from . import records as rc
+from . import docscheck as dc
+from . import docswrite as dw
+from . import verify as vf
 from .jsonstore import merge_items, upsert_item
-from .parse import is_test_evidence, md_flow_to_item, md_requirement_to_item, rel
+from .parse import ASYNC_RUNTIMES, is_test_evidence, md_flow_to_item, md_requirement_to_item, rel
 
 mcp = FastMCP(
     "spec",
     instructions=(
-        "Project specification tools: searchable docs, user flows and requirements with "
-        "coverage and validation, plus schema-validated record collections (rec_*). "
-        "Read-mostly; the only writers are req_upsert, req_link, flow_upsert, dm_upsert_*, "
-        "design_upsert, rec_upsert and spec_index, and they never rewrite prose files they did not create."
+        "Project specification tools: searchable docs with a status model (current/superseded/"
+        "historical), hygiene checks and evidence verification for flows and requirements, plus "
+        "schema-validated record collections (rec_*). Read-mostly; the writers are req_upsert, "
+        "req_link, flow_upsert, dm_upsert_*, design_upsert, rec_upsert, spec_index, "
+        "docs_upsert / docs_supersede (front matter and archive moves only) and the explicit "
+        "fix=true of flow_verify / req_verify; they never rewrite prose they were not asked to."
     ),
 )
 
@@ -108,38 +113,85 @@ def spec_config() -> dict[str, Any]:
 # ---------------------------------------------------------------- docs
 
 
-@_tool
-def docs_search(query: str, limit: int = 10, glob: str | None = None) -> dict[str, Any]:
-    """BM25 search over documentation chunks (one chunk per markdown heading). Returns
-    file, heading, line, score and a snippet, plus how many chunks/files were searched.
-    `glob` narrows the files (e.g. "docs/flows/**")."""
-    idx = _idx()
-    chunks = idx.chunks
-    if glob:
-        chunks = [c for c in chunks if fnmatch.fnmatch(c["file"], glob)]
-        from .bm25 import BM25
+def _doc_scope(idx: SpecIndex, glob: str | None, status: str | None, topic: str | None, include_stale: bool) -> tuple[set[str], set[str], int]:
+    """Files visible to a docs query -> (allowed files, hidden files, matched file count).
+    An explicit `status` always wins; otherwise default_hidden_statuses are hidden unless include_stale."""
+    hidden_statuses = idx.hidden_statuses()
+    want = status.strip().lower() if status else None
+    allowed: set[str] = set()
+    hidden: set[str] = set()
+    matched = 0
+    for d in idx.doc_list:
+        f = d["file"]
+        if glob and not (fnmatch.fnmatch(f, glob) or dc.glob_match(f, glob)):
+            continue
+        if topic and (d.get("topic") or "").lower() != topic.strip().lower():
+            continue
+        matched += 1
+        eff = idx.effective_status(d)
+        if want is not None:
+            if eff == want:
+                allowed.add(f)
+            continue
+        if not include_stale and eff in hidden_statuses:
+            hidden.add(f)
+            continue
+        allowed.add(f)
+    return allowed, hidden, matched
 
-        engine = BM25([tokenize(f"{c['heading']}\n{c['text']}") for c in chunks])
-    else:
-        engine = idx.bm25()
+
+@_tool
+def docs_search(
+    query: str,
+    limit: int = 10,
+    glob: str | None = None,
+    status: str | None = None,
+    topic: str | None = None,
+    include_stale: bool = False,
+) -> dict[str, Any]:
+    """BM25 search over documentation chunks (one chunk per heading section, long sections
+    split on paragraphs; each hit carries the heading breadcrumb `path`). By default documents
+    whose front-matter status is superseded or historical are hidden and counted in
+    `hidden_files`; pass `include_stale=true` to see them or `status="historical"` to ask for
+    one status. `glob` narrows files (e.g. "docs/flows/**"), `topic` filters by front-matter
+    topic. Use docs_list to browse files; use req_*/flow_* for structured items."""
+    idx = _idx()
+    allowed, hidden_set, matched = _doc_scope(idx, glob, status, topic, include_stale)
+    hidden_files = len(hidden_set)
+    status_of = idx.doc_status_map()
     toks = tokenize(query)
+    pool = [i for i, c in enumerate(idx.chunks) if c["file"] in allowed]
     hits = []
-    for i, score in engine.search(toks, limit=max(1, min(limit, 100))):
-        c = chunks[i]
-        hits.append(
-            {
-                "file": c["file"],
-                "heading": c["heading"],
-                "line": c["line"],
-                "score": round(score, 3),
-                "snippet": _snippet(c["text"], toks),
-            }
-        )
+    if toks and pool:
+        ranked = idx.bm25().search(toks, limit=max(1, len(idx.chunks)))
+        keep = set(pool)
+        for i, score in ranked:
+            if i not in keep:
+                continue
+            c = idx.chunks[i]
+            hits.append(
+                {
+                    "file": c["file"],
+                    "heading": c["heading"],
+                    "path": c.get("path") or c["heading"],
+                    "line": c["line"],
+                    "status": status_of.get(c["file"]),
+                    "score": round(score, 3),
+                    "snippet": _snippet(c["text"], toks),
+                }
+            )
+            if len(hits) >= max(1, min(limit, 100)):
+                break
+    hidden_chunks = sum(1 for c in idx.chunks if c["file"] in hidden_set)
     return {
         "query": query,
         "hits": hits,
-        "searched_chunks": len(chunks),
-        "searched_files": len({c["file"] for c in chunks}),
+        "searched_chunks": len(pool),
+        "searched_files": len(allowed),
+        "hidden_files": hidden_files,
+        "hidden_chunks": hidden_chunks,
+        "hidden_count": hidden_files,
+        "total_files": len(idx.doc_list),
     }
 
 
@@ -158,41 +210,65 @@ def _snippet(text: str, toks: list[str], width: int = 220) -> str:
 @_tool
 def docs_get(path: str, heading: str | None = None) -> dict[str, Any]:
     """Read a documentation file, or only the section under `heading` (case-insensitive
-    match on the heading text). Returns text with its 1-based line range."""
+    match on the heading text; the whole section even when it is split into several search
+    chunks). Returns text with its 1-based line range and the document status."""
     idx = _idx()
     p = idx.resolve(path)
     if not p.is_file():
         raise SpecError("not_found", f"no such file: {path}")
     file = rel(p, idx.root)
+    entry = next((d for d in idx.doc_list if d["file"] == file), None)
+    status = idx.effective_status(entry) if entry else None
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     if heading is None:
-        return {"file": file, "line_start": 1, "line_end": len(lines), "text": "\n".join(lines)}
+        return {"file": file, "status": status, "line_start": 1, "line_end": len(lines), "text": "\n".join(lines)}
     want = heading.strip().lower()
-    chunk = next((c for c in idx.chunks if c["file"] == file and c["heading"].lower() == want), None)
+    chunk = next((c for c in idx.chunks if c["file"] == file and c["heading"].lower() == want and c.get("part", 0) == 0), None)
     if chunk is None:
         from .parse import chunk_doc
 
-        chunk = next((c for c in chunk_doc(p, idx.root) if c["heading"].lower() == want), None)
+        chunk = next((c for c in chunk_doc(p, idx.root) if c["heading"].lower() == want and c.get("part", 0) == 0), None)
     if chunk is None:
         headings = [c["heading"] for c in idx.chunks if c["file"] == file]
         raise SpecError("not_found", f"heading {heading!r} not in {file}", available=headings[:50])
+    end = chunk.get("section_end", chunk["line_end"])
     return {
         "file": file,
+        "status": status,
         "heading": chunk["heading"],
         "line_start": chunk["line"],
-        "line_end": chunk["line_end"],
-        "text": "\n".join(lines[chunk["line"] - 1 : chunk["line_end"]]),
+        "line_end": end,
+        "text": "\n".join(lines[chunk["line"] - 1 : end]),
     }
 
 
 @_tool
-def docs_list(glob: str | None = None, limit: int = 200) -> dict[str, Any]:
-    """List documentation files (path, title = first H1, size). `glob` filters paths."""
+def docs_list(glob: str | None = None, limit: int = 200, status: str | None = None, topic: str | None = None, include_stale: bool = False) -> dict[str, Any]:
+    """List documentation files: path, title (front-matter title or first H1), size, status,
+    topic. Same visibility rules as docs_search: superseded/historical files are hidden by
+    default (`hidden_count`), `include_stale=true` shows them, `status` picks exactly one."""
     idx = _idx()
-    files = idx.doc_list
-    if glob:
-        files = [f for f in files if fnmatch.fnmatch(f["file"], glob)]
-    return {"files": files[: max(1, limit)], "total": len(files), "scanned_files": idx.doc_files}
+    allowed, hidden_set, matched = _doc_scope(idx, glob, status, topic, include_stale)
+    hidden = len(hidden_set)
+    files = [{**d, "status": idx.effective_status(d)} for d in idx.doc_list if d["file"] in allowed]
+    return {"files": files[: max(1, limit)], "total": len(files), "scanned_files": idx.doc_files, "hidden_count": hidden, "matched_before_status": matched}
+
+
+@_tool
+def docs_check(glob: str | None = None, checks: list[str] | None = None, limit: int = 500) -> dict[str, Any]:
+    """Read-only hygiene audit of the documentation corpus (no writes): missing or unknown
+    front-matter status, `superseded` without a valid `superseded_by`, historical files
+    outside archive_dir, dead relative links and anchors, backticked repo paths that do not
+    exist (rule `unresolved_path`, informational), and configured `docs.stale_patterns`
+    (regex per line, skipped in files whose status is listed in `exclude_statuses`). Returns
+    `checked` (files), `by_status`, `counts_by_rule` and `findings[{file,line,rule,detail}]`.
+    Use flow_verify/req_verify for evidence in JSON items; use docs_search to read content."""
+    idx = _idx()
+    if checks:
+        bad = dc.unknown_rules(checks)
+        if bad:
+            raise SpecError("validation", f"unknown checks: {bad}", available=list(dc.RULES))
+    return dc.check_docs(idx, glob, checks, limit)
 
 
 # ---------------------------------------------------------------- requirements
@@ -366,13 +442,17 @@ def flow_get(id: str) -> dict[str, Any]:
 def flow_upsert(
     id: str,
     title: str,
-    steps: list[dict[str, str]],
+    steps: list[dict[str, Any]],
     requirements: list[str] | None = None,
     roles: list[str] | None = None,
     file: str | None = None,
+    async_steps: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Create or replace a flow in a JSON collection file (default: flows.write_file).
-    Steps are {n, role, screen, action, evidence}; `n` is filled in when missing.
+    Steps are {n, role, screen, action, evidence, anchors?}; `n` is filled in when missing and
+    `anchors` is an optional list of {file, symbol, line} that flow_verify can re-locate.
+    `async_steps` become the flow-level `async` list of {n, runtime, action, evidence} with
+    runtime one of nest|lambda|stepfn|sns|sqs|eventbridge (work done outside the request).
     Refuses when the id is defined in another file (e.g. a hand-written markdown flow)."""
     idx = _idx()
     slug = id.strip()
@@ -385,7 +465,12 @@ def flow_upsert(
     existing = idx.flows.get(slug)
     if existing and existing["file"] != target_rel:
         raise SpecError("validation", f"flow {slug} is defined in {existing['file']}:{existing['line']}; edit it there", file=existing["file"])
+    bad = [a.get("runtime") for a in (async_steps or []) if a.get("runtime") not in ASYNC_RUNTIMES]
+    if bad:
+        raise SpecError("validation", f"async runtime must be one of {list(ASYNC_RUNTIMES)}, got {bad}")
     item = {"id": slug, "title": title, "roles": list(roles or []), "requirements": list(requirements or []), "steps": list(steps or [])}
+    if async_steps is not None:
+        item["async"] = list(async_steps)
     action = upsert_item(target, item, "flows")
     idx.invalidate()
     idx.ensure(force=True)
@@ -439,6 +524,77 @@ def spec_import_markdown(collection: str, glob: str | None = None, target_file: 
     return out
 
 
+def _resolver(idx: SpecIndex) -> vf.Resolver:
+    return vf.Resolver(idx.root, list(idx.cfg["docs"].get("evidence_roots") or []))
+
+
+@_tool
+def flow_verify(id: str | None = None, fix: bool = False, include_ok: bool = False, limit: int = 200) -> dict[str, Any]:
+    """Check that the evidence of JSON flows still points at real code. Every step's
+    `evidence` (`path:line[-line]`), its optional `anchors` ([{file, symbol, line}]) and the
+    flow-level `async` evidence are resolved under docs.evidence_roots. Statuses: ok, moved
+    (symbol found elsewhere -> `new_line`), symbol_missing, file_missing, line_out_of_range,
+    ambiguous (several candidate files), wrong_root (exists outside the evidence roots),
+    invalid_anchor. Evidence without a symbol can only be checked for file and line range
+    (`unanchored_ok`). fix=true rewrites `moved` lines in the JSON (atomic write); nothing
+    else is changed. Markdown flows are skipped (listed in `skipped_files`). Use req_verify
+    for requirements, docs_check for prose."""
+    idx = _idx()
+    if id is not None and id not in idx.flows:
+        raise SpecError("not_found", f"flow {id!r} not found", available=sorted(idx.flows)[:50])
+    res = _resolver(idx)
+    files = [idx.resolve(f) for f in idx.flow_files]
+    out = vf.verify_items("flow", files, idx.root, res, lambda item, path: id is None or str(item.get("id")) == id, fix, include_ok, limit)
+    out["flows_in_index"] = len(idx.flows)
+    if fix and out["fixed_total"]:
+        idx.invalidate()
+        idx.ensure(force=True)
+    return out
+
+
+@_tool
+def req_verify(domain: str | None = None, fix: bool = False, include_ok: bool = False, limit: int = 200) -> dict[str, Any]:
+    """Check that the code references of JSON requirements still resolve. Refs are the
+    `path:line[-line]` mentions in `text` / `acceptance` plus optional `evidence[]` entries and
+    `anchors` ([{file, symbol, line}]); resolution and statuses are the same as flow_verify
+    (ok, moved, symbol_missing, file_missing, line_out_of_range, ambiguous, wrong_root,
+    invalid_anchor). `domain` is the requirement's domain (default: file stem). fix=true
+    rewrites `moved` refs in place. Markdown requirement files are skipped. Returns counts per
+    status over `evidence_entries` as the denominator."""
+    idx = _idx()
+    res = _resolver(idx)
+    files = [idx.resolve(f) for f in idx.req_files]
+    out = vf.verify_items("requirement", files, idx.root, res, lambda item, path: domain is None or str(item.get("domain") or path.stem) == domain, fix, include_ok, limit)
+    out["requirements_in_index"] = len(idx.requirements)
+    if fix and out["fixed_total"]:
+        idx.invalidate()
+        idx.ensure(force=True)
+    return out
+
+
+@_tool
+def docs_upsert(path: str, front_matter: dict[str, Any] | None = None, body: str | None = None) -> dict[str, Any]:
+    """Create or update a markdown document's front matter (status, topic, owner, supersedes,
+    superseded_by, verified_at, title; a null value removes the key) and optionally replace
+    its body. The path must match docs.globs and not docs.exclude; status must be one of
+    docs.statuses and verified_at an ISO date. A new file needs `body`. Prefer
+    docs_supersede to retire a document (it also archives it)."""
+    idx = _idx()
+    return dw.upsert(idx, path, front_matter, body)
+
+
+@_tool
+def docs_supersede(path: str, by: str, reason: str, move_to_archive: bool = True, dry_run: bool = False) -> dict[str, Any]:
+    """Retire a document: set status `superseded` and `superseded_by`, put a banner
+    "> ZASTĄPIONY przez `by` — reason (date)" at the top and (default) move it under
+    docs.archive_dir/<topic or first directory>/ with `git mv` when tracked, else a rename.
+    Refuses when `by` does not exist or the destination is taken; nothing changes then.
+    `inbound_references` lists docs still linking to the old path. dry_run=true only reports
+    the plan."""
+    idx = _idx()
+    return dw.supersede(idx, path, by, reason, move_to_archive, dry_run)
+
+
 # ---------------------------------------------------------------- validation / index
 
 
@@ -463,6 +619,19 @@ def spec_validate() -> dict[str, Any]:
         for ref in f["requirements"]:
             if ref not in defined:
                 findings.append({"kind": "dangling_id", "id": ref, "from": f"{f['file']}:{f['line']}", "in": "flow " + f["id"]})
+    need_sr = bool(idx.cfg["flows"].get("require_screen_role"))
+    for f in idx.flows.values():
+        for st in f["steps"]:
+            if need_sr and f.get("format") == "json":
+                for fld in ("screen", "role"):
+                    if not st.get(fld):
+                        findings.append({"kind": f"step_missing_{fld}", "severity": "warning", "flow": f["id"], "step": st["n"], "from": f"{f['file']}"})
+            for a in st.get("anchors") or []:
+                if not a.get("file"):
+                    findings.append({"kind": "anchor_invalid", "severity": "warning", "flow": f["id"], "step": st["n"]})
+        for a in f.get("async") or []:
+            if a.get("runtime") not in ASYNC_RUNTIMES:
+                findings.append({"kind": "invalid_async_runtime", "severity": "warning", "flow": f["id"], "step": a.get("n"), "runtime": a.get("runtime"), "allowed": list(ASYNC_RUNTIMES)})
     links = idx.load_links()
     for rid, entry in links.items():
         if rid not in defined:

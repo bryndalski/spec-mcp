@@ -15,7 +15,17 @@ from typing import Any
 from .errors import SpecError
 
 DEFAULTS: dict[str, Any] = {
-    "docs": {"globs": ["docs/**/*.md"], "exclude": ["**/node_modules/**"]},
+    "docs": {
+        "globs": ["docs/**/*.md"],
+        "exclude": ["**/node_modules/**"],
+        "statuses": ["current", "superseded", "historical", "draft"],
+        "default_hidden_statuses": ["superseded", "historical"],
+        "archive_dir": "docs/archive",
+        "require_front_matter": False,
+        "stale_patterns": [],
+        "evidence_roots": [],
+        "max_chunk_chars": 1200,
+    },
     "requirements": {
         "globs": ["docs/requirements/**/*.md", "docs/requirements/**/*.json"],
         "exclude": ["**/node_modules/**"],
@@ -27,6 +37,7 @@ DEFAULTS: dict[str, Any] = {
         "globs": ["docs/flows/**/*.md", "docs/flows/**/*.json"],
         "exclude": ["**/node_modules/**"],
         "heading_pattern": r"^##\s+(.+)$",
+        "require_screen_role": False,
         "write_file": "docs/flows/flows.json",
     },
     "datamodel": {
@@ -91,6 +102,28 @@ def load_config(path: Path | None = None, root: Path | None = None) -> dict[str,
             re.compile(pat, re.MULTILINE)
         except re.error as e:
             raise SpecError("config", f"{section}.{key} is not a valid regex: {e}") from e
+    _validate_docs(cfg["docs"])
     cfg["_root"] = str(root)
     cfg["_source"] = source
     return cfg
+
+
+def _validate_docs(docs: dict[str, Any]) -> None:
+    """Fail early (category `config`) on malformed document-status settings."""
+    for key in ("statuses", "default_hidden_statuses", "evidence_roots"):
+        if not isinstance(docs.get(key), list) or not all(isinstance(x, str) for x in docs[key]):
+            raise SpecError("config", f"docs.{key} must be a list of strings")
+    unknown = [x for x in docs["default_hidden_statuses"] if x not in docs["statuses"]]
+    if unknown:
+        raise SpecError("config", f"docs.default_hidden_statuses not in docs.statuses: {unknown}")
+    pats = docs.get("stale_patterns")
+    if not isinstance(pats, list):
+        raise SpecError("config", "docs.stale_patterns must be a list")
+    for i, sp in enumerate(pats):
+        if not isinstance(sp, dict) or not sp.get("id") or not sp.get("regex"):
+            raise SpecError("config", f"docs.stale_patterns[{i}] needs `id` and `regex`")
+        flags = re.IGNORECASE if "i" in str(sp.get("flags", "")) else 0
+        try:
+            re.compile(sp["regex"], flags)
+        except re.error as e:
+            raise SpecError("config", f"docs.stale_patterns[{sp['id']}].regex is not a valid regex: {e}") from e

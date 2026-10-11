@@ -14,7 +14,7 @@ _CODE_REF = re.compile(
 _TEST_HINT = re.compile(r"(\.spec\.|\.test\.|/tests?/|__tests__|e2e|\.e2e\.)", re.IGNORECASE)
 _BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
-_FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+_FRONTMATTER = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", re.DOTALL)
 _NUMBERED = re.compile(r"^\s*(\d+(?:\.\d+)*)[.)]\s+(.*)$")
 
 
@@ -262,13 +262,86 @@ def parse_flows(path: Path, heading_re: re.Pattern[str], id_re: re.Pattern[str],
 # ---------------------------------------------------------------- docs
 
 
-def chunk_doc(path: Path, root: Path) -> list[dict[str, Any]]:
+def _fm_line_count(text: str) -> int:
+    m = _FRONTMATTER.match(text)
+    return text[: m.end()].count("\n") if m else 0
+
+
+def doc_meta(path: Path) -> dict[str, Any]:
+    """Front matter of a markdown file ({} when absent or unreadable)."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return {}
+    if not head.startswith("---"):
+        return {}
+    try:
+        return parse_frontmatter(path.read_text(encoding="utf-8", errors="replace"))[0]
+    except OSError:
+        return {}
+
+
+def _split_body(lines: list[str], first_line: int, max_chars: int) -> list[tuple[int, int, str]]:
+    """Split a section body (lines starting at 1-based `first_line`) into pieces of at most
+    ~max_chars, breaking on blank lines (paragraphs) and, for oversized paragraphs, on lines.
+    Returns (line_start, line_end, text); an empty body yields one empty piece."""
+    if not lines:
+        return [(first_line, first_line - 1, "")]
+    paras: list[list[tuple[int, str]]] = []
+    cur: list[tuple[int, str]] = []
+    for off, line in enumerate(lines):
+        if line.strip() == "":
+            if cur:
+                paras.append(cur)
+                cur = []
+            continue
+        cur.append((first_line + off, line))
+    if cur:
+        paras.append(cur)
+    units: list[list[tuple[int, str]]] = []
+    for para in paras:
+        if sum(len(t) + 1 for _, t in para) <= max_chars:
+            units.append(para)
+            continue
+        piece: list[tuple[int, str]] = []
+        size = 0
+        for item in para:
+            if piece and size + len(item[1]) + 1 > max_chars:
+                units.append(piece)
+                piece, size = [], 0
+            piece.append(item)
+            size += len(item[1]) + 1
+        if piece:
+            units.append(piece)
+    out: list[tuple[int, int, str]] = []
+    group: list[tuple[int, str]] = []
+    size = 0
+    for unit in units:
+        usize = sum(len(t) + 1 for _, t in unit) + 1
+        if group and size + usize > max_chars:
+            out.append((group[0][0], group[-1][0], "\n".join(t for _, t in group)))
+            group, size = [], 0
+        group.extend(unit)
+        size += usize
+    if group:
+        out.append((group[0][0], group[-1][0], "\n".join(t for _, t in group)))
+    return out or [(first_line, first_line - 1, "")]
+
+
+def chunk_doc(path: Path, root: Path, max_chars: int = 1200) -> list[dict[str, Any]]:
+    """One chunk per heading section, split into <= max_chars pieces on paragraph boundaries.
+    Each chunk carries `path` (breadcrumb "H1 > H2 > H3") and `section_end` (last line of
+    the whole section). Front matter is skipped; headings inside code fences are ignored."""
     text = path.read_text(encoding="utf-8", errors="replace")
     file = rel(path, root)
     lines = text.splitlines()
+    skip = _fm_line_count(text)
     heads: list[tuple[int, int, str]] = []
     in_fence = False
     for n, line in enumerate(lines, start=1):
+        if n <= skip:
+            continue
         if line.lstrip().startswith("```"):
             in_fence = not in_fence
             continue
@@ -279,13 +352,37 @@ def chunk_doc(path: Path, root: Path) -> list[dict[str, Any]]:
             heads.append((n, len(m.group(1)), m.group(2).strip()))
     chunks: list[dict[str, Any]] = []
     first = heads[0][0] if heads else len(lines) + 1
-    pre = "\n".join(lines[: first - 1]).strip()
-    if pre:
-        chunks.append({"file": file, "heading": "", "level": 0, "line": 1, "line_end": first - 1, "text": pre})
+    pre_lines = lines[skip : first - 1]
+    if "\n".join(pre_lines).strip():
+        parts = _split_body(pre_lines, skip + 1, max_chars)
+        for part, (a, b, t) in enumerate(parts):
+            if not t:
+                continue
+            start = skip + 1 if part == 0 else a
+            stop = first - 1 if len(parts) == 1 else b
+            chunks.append({"file": file, "heading": "", "path": "", "level": 0, "line": start, "line_end": stop, "section_end": first - 1, "part": part, "text": t})
+    stack: list[tuple[int, str]] = []
     for i, (n, level, heading) in enumerate(heads):
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        stack.append((level, heading))
+        crumb = " > ".join(h for _, h in stack)
         end = heads[i + 1][0] - 1 if i + 1 < len(heads) else len(lines)
-        body = "\n".join(lines[n:end]).strip()
-        chunks.append({"file": file, "heading": heading, "level": level, "line": n, "line_end": end, "text": body})
+        parts = _split_body(lines[n:end], n + 1, max_chars)
+        for part, (a, b, t) in enumerate(parts):
+            chunks.append(
+                {
+                    "file": file,
+                    "heading": heading,
+                    "path": crumb,
+                    "level": level,
+                    "line": n if part == 0 else a,
+                    "line_end": end if len(parts) == 1 else b,
+                    "section_end": end,
+                    "part": part,
+                    "text": t,
+                }
+            )
     return chunks
 
 
@@ -306,8 +403,10 @@ def doc_title(path: Path) -> str:
 
 # ---------------------------------------------------------------- JSON collections
 
-REQ_KEYS = ("id", "title", "text", "status", "domain", "tags", "acceptance", "links", "source")
-FLOW_KEYS = ("id", "title", "roles", "requirements", "steps", "source")
+REQ_KEYS = ("id", "title", "text", "status", "domain", "tags", "acceptance", "links", "anchors", "source")
+FLOW_KEYS = ("id", "title", "roles", "requirements", "steps", "async", "source")
+ASYNC_KEYS = ("n", "runtime", "action", "evidence")
+ASYNC_RUNTIMES = ("nest", "lambda", "stepfn", "sns", "sqs", "eventbridge")
 STEP_KEYS = ("n", "role", "screen", "action", "evidence")
 
 
@@ -374,6 +473,7 @@ def norm_requirement(item: dict[str, Any], *, file: str, domain_default: str, id
         "tags": [str(t) for t in _as_list(item.get("tags"))],
         "acceptance": acceptance,
         "links": links,
+        "anchors": norm_anchors(item.get("anchors")),
         "source": {"file": str(src.get("file") or file), "line": src.get("line")},
         "file": file,
         "line": src.get("line"),
@@ -386,8 +486,40 @@ def norm_requirement(item: dict[str, Any], *, file: str, domain_default: str, id
 def norm_step(s: Any, n: int) -> dict[str, str]:
     if not isinstance(s, dict):
         return {"n": str(n), "role": "", "screen": "", "action": str(s), "evidence": ""}
-    out = {k: str(s.get(k, "") or "") for k in STEP_KEYS}
+    out: dict[str, Any] = {k: str(s.get(k, "") or "") for k in STEP_KEYS}
     out["n"] = out["n"] or str(n)
+    anchors = norm_anchors(s.get("anchors"))
+    if anchors:
+        out["anchors"] = anchors
+    return out
+
+
+def norm_anchors(v: Any) -> list[dict[str, Any]]:
+    """Evidence anchors: [{file, symbol?, line?}]. Entries that are not objects are dropped."""
+    out: list[dict[str, Any]] = []
+    for a in _as_list(v):
+        if not isinstance(a, dict) or not a.get("file"):
+            continue
+        item: dict[str, Any] = {"file": str(a["file"])}
+        if a.get("symbol"):
+            item["symbol"] = str(a["symbol"])
+        if a.get("line") not in (None, ""):
+            try:
+                item["line"] = int(a["line"])
+            except (TypeError, ValueError):
+                pass
+        out.append(item)
+    return out
+
+
+def norm_async(v: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for i, a in enumerate(_as_list(v), start=1):
+        if not isinstance(a, dict):
+            a = {"action": str(a)}
+        row = {k: str(a.get(k, "") or "") for k in ASYNC_KEYS}
+        row["n"] = row["n"] or str(i)
+        out.append(row)
     return out
 
 
@@ -407,6 +539,7 @@ def norm_flow(item: dict[str, Any], *, file: str, id_re: re.Pattern[str]) -> dic
         "line_end": None,
         "roles": [str(r) for r in _as_list(item.get("roles"))],
         "steps": steps,
+        "async": norm_async(item.get("async")),
         "requirements": reqs,
         "source": {"file": str(src.get("file") or file), "line": src.get("line")},
         "format": "json",
