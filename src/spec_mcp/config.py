@@ -29,6 +29,12 @@ DEFAULTS: dict[str, Any] = {
         "heading_pattern": r"^##\s+(.+)$",
         "write_file": "docs/flows/flows.json",
     },
+    "datamodel": {
+        "globs": ["docs/datamodel/*.json"],
+        "exclude": ["**/node_modules/**"],
+        "max_gsis_per_table": 3,
+        "write_file": "docs/datamodel/datamodel.json",
+    },
     "links_file": ".spec-links.json",
     "index_file": ".spec-index.json",
 }

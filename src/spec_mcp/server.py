@@ -21,6 +21,7 @@ from .bm25 import tokenize
 from .config import config_path, load_config
 from .errors import SpecError
 from .index import GENERATED_MARKER, SpecIndex
+from . import datamodel as dm
 from .jsonstore import merge_items, upsert_item
 from .parse import is_test_evidence, md_flow_to_item, md_requirement_to_item, rel
 
@@ -93,8 +94,8 @@ def spec_config() -> dict[str, Any]:
         "config": cfg,
         "config_file": idx.cfg["_source"],
         "root": idx.cfg["_root"],
-        "counts": {"docs": idx.doc_files, "requirements": len(idx.requirements), "flows": len(idx.flows)},
-        "files": {"requirements": idx.req_files, "flows": idx.flow_files},
+        "counts": {"docs": idx.doc_files, "requirements": len(idx.requirements), "flows": len(idx.flows), "datamodel": len(idx.tables)},
+        "files": {"requirements": idx.req_files, "flows": idx.flow_files, "datamodel": idx.dm_files},
         "index_file": str(idx.cache_path),
         "index_age_seconds": idx.age_seconds(),
         "warnings": idx.warnings,
@@ -488,7 +489,7 @@ def spec_validate() -> dict[str, Any]:
 @_tool
 def spec_index() -> dict[str, Any]:
     """Force a rebuild of the index and regenerate INDEX.md in every requirements and flows
-    directory (one table row per item, marked as generated). Returns counts and paths."""
+    directory and in the data-model directory (marked as generated). Returns counts and paths."""
     idx = _idx(force=True)
     written: list[str] = []
     req_dirs: dict[Path, list[dict[str, Any]]] = {}
@@ -514,9 +515,280 @@ def spec_index() -> dict[str, Any]:
         p = d / "INDEX.md"
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         written.append(rel(p, idx.root))
+    if idx.tables:
+        dm_dir = idx.resolve(idx.cfg["datamodel"]["write_file"]).parent
+        if idx.dm_files:
+            dm_dir = idx.resolve(idx.dm_files[0]).parent
+        p = dm_dir / "INDEX.md"
+        p.write_text(dm.render_index(list(idx.tables.values()), dm.all_relations(idx.tables), GENERATED_MARKER), encoding="utf-8")
+        written.append(rel(p, idx.root))
     idx.invalidate()
     idx.ensure(force=True)
-    return {"requirements": len(idx.requirements), "flows": len(idx.flows), "docs": idx.doc_files, "written": written}
+    return {"requirements": len(idx.requirements), "flows": len(idx.flows), "docs": idx.doc_files, "datamodel": len(idx.tables), "written": written}
+
+
+# ---------------------------------------------------------------- data model
+
+
+def _dm_denominator(idx: SpecIndex) -> dict[str, int]:
+    return {
+        "files": len(idx.dm_files),
+        "tables": len(idx.tables),
+        "access_patterns": sum(len(t["access_patterns"]) for t in idx.tables.values()),
+        "relations": sum(len(t["relations"]) for t in idx.tables.values()),
+        "attributes": sum(len(t["attributes"]) for t in idx.tables.values()),
+    }
+
+
+@_tool
+def dm_tables() -> dict[str, Any]:
+    """List data-model tables: name, pk/sk names, number of GSIs, entities, attributes,
+    relations and access patterns, and the JSON file that owns each table. Use this
+    instead of grepping Terraform or repositories to learn the table layout."""
+    idx = _idx()
+    items = [
+        {
+            "name": t["name"],
+            "pk": t["pk"]["name"] if t["pk"] else None,
+            "sk": t["sk"]["name"] if t["sk"] else None,
+            "gsis": len(t["gsis"]),
+            "entities": len(t["entities"]),
+            "access_patterns": len(t["access_patterns"]),
+            "relations": len(t["relations"]),
+            "attributes": len(t["attributes"]),
+            "file": t["file"],
+        }
+        for t in sorted(idx.tables.values(), key=lambda x: x["name"])
+    ]
+    return {"items": items, "total": len(items), "scanned_files": len(idx.dm_files)}
+
+
+@_tool
+def dm_table(name: str) -> dict[str, Any]:
+    """Full record of one table (keys, GSIs, TTL, stream, entities, attributes, relations,
+    access patterns) plus inbound relations (other tables pointing here) and outbound
+    relations (this table pointing elsewhere)."""
+    idx = _idx()
+    t = idx.tables.get(name)
+    if t is None:
+        raise SpecError("not_found", f"table {name!r} not found", available=sorted(idx.tables)[:50])
+    rels = dm.all_relations(idx.tables)
+    return {
+        "table": t,
+        "outbound": [r for r in rels if r["from_table"] == name],
+        "inbound": [r for r in rels if r["to_table"] == name],
+    }
+
+
+@_tool
+def dm_relations(table: str | None = None, entity: str | None = None, format: str = "json") -> dict[str, Any]:
+    """Pseudo-relations between tables (DynamoDB has no foreign keys; these are the links
+    the code relies on). Filter by table (either end) or by entity. format="mermaid"
+    returns an erDiagram you can paste into docs."""
+    idx = _idx()
+    if format not in ("json", "mermaid"):
+        raise SpecError("validation", 'format must be "json" or "mermaid"')
+    rels = dm.all_relations(idx.tables)
+    if table:
+        rels = [r for r in rels if table in (r["from_table"], r["to_table"])]
+    if entity:
+        owners = {t["name"] for t in idx.tables.values() if entity in t["entities"]}
+        rels = [r for r in rels if r["from_table"] in owners or r["to_table"] in owners]
+    out: dict[str, Any] = {"total": len(rels), "denominator": _dm_denominator(idx)}
+    if format == "mermaid":
+        out["mermaid"] = dm.mermaid(rels)
+    else:
+        out["items"] = rels
+    return out
+
+
+@_tool
+def dm_access_patterns(
+    table: str | None = None, index: str | None = None, operation: str | None = None, repository: str | None = None
+) -> dict[str, Any]:
+    """Access patterns across tables with the repository method that implements each.
+    Filters: table, index (GSI name), operation (case-insensitive), repository (substring)."""
+    idx = _idx()
+    pats = dm.all_patterns(idx.tables)
+    if table:
+        pats = [p for p in pats if p["table"] == table]
+    if index:
+        pats = [p for p in pats if p["index"] == index]
+    if operation:
+        pats = [p for p in pats if p["operation"].lower() == operation.lower()]
+    if repository:
+        pats = [p for p in pats if repository in p["repository"]]
+    return {"items": pats, "total": len(pats), "denominator": _dm_denominator(idx)}
+
+
+_DM_WHERE = ("table", "entity", "attribute", "index", "operation", "kind")
+
+
+@_tool
+def dm_query(where: dict[str, str]) -> dict[str, Any]:
+    """Generic filter over the data model. `where` keys: table, entity, attribute, index,
+    operation, kind. Returns the matching tables, attributes, access patterns and
+    relations together with counts and the denominator."""
+    idx = _idx()
+    bad = [k for k in where if k not in _DM_WHERE]
+    if bad:
+        raise SpecError("validation", f"unknown where keys: {bad}; allowed: {list(_DM_WHERE)}")
+    tables = list(idx.tables.values())
+    if where.get("table"):
+        tables = [t for t in tables if t["name"] == where["table"]]
+    if where.get("entity"):
+        tables = [t for t in tables if where["entity"] in t["entities"]]
+    if where.get("attribute"):
+        tables = [t for t in tables if where["attribute"] in dm.table_attr_names(t)]
+    if where.get("index"):
+        tables = [t for t in tables if any(g["name"] == where["index"] for g in t["gsis"])]
+    names = {t["name"] for t in tables}
+    attrs = [{**a, "table": t["name"]} for t in tables for a in t["attributes"]]
+    if where.get("attribute"):
+        attrs = [a for a in attrs if a["name"] == where["attribute"]]
+    pats = [p for p in dm.all_patterns(idx.tables) if p["table"] in names]
+    if where.get("index"):
+        pats = [p for p in pats if p["index"] == where["index"]]
+    if where.get("operation"):
+        pats = [p for p in pats if p["operation"].lower() == where["operation"].lower()]
+    rels = dm.all_relations(idx.tables)
+    if where.get("table"):
+        rels = [r for r in rels if where["table"] in (r["from_table"], r["to_table"])]
+    elif where.get("entity") or where.get("attribute") or where.get("index"):
+        rels = [r for r in rels if r["from_table"] in names or r["to_table"] in names]
+    if where.get("kind"):
+        rels = [r for r in rels if r["kind"] == where["kind"]]
+    if where.get("attribute"):
+        rels = [r for r in rels if r["from"].endswith("." + where["attribute"]) or r["to"].endswith("." + where["attribute"])]
+    return {
+        "where": where,
+        "tables": [{"name": t["name"], "pk": t["pk"], "sk": t["sk"], "entities": t["entities"], "gsis": [g["name"] for g in t["gsis"]]} for t in tables],
+        "attributes": attrs,
+        "access_patterns": pats,
+        "relations": rels,
+        "counts": {"tables": len(tables), "attributes": len(attrs), "access_patterns": len(pats), "relations": len(rels)},
+        "denominator": _dm_denominator(idx),
+    }
+
+
+_DM_BY = ("table", "index", "entity", "operation", "repository", "kind")
+_DM_TABLE_METRICS = ("count", "gsis", "attributes", "relations", "patterns")
+
+
+@_tool
+def dm_aggregate(by: str, metric: str = "count") -> dict[str, Any]:
+    """Counts grouped by table / index / entity / operation / repository / kind.
+    metric="count" counts access patterns (by table, index, operation, repository),
+    tables (by entity) or relations (by kind). With by="table" the metric may also be
+    "gsis", "attributes", "relations" or "patterns"."""
+    idx = _idx()
+    if by not in _DM_BY:
+        raise SpecError("validation", f"by must be one of {list(_DM_BY)}")
+    if metric != "count" and (by != "table" or metric not in _DM_TABLE_METRICS):
+        raise SpecError("validation", f'metric {metric!r} is only valid with by="table" ({list(_DM_TABLE_METRICS)})')
+    buckets: dict[str, int] = {}
+    pats = dm.all_patterns(idx.tables)
+    rels = dm.all_relations(idx.tables)
+    if by == "table":
+        key = {"count": "access_patterns", "patterns": "access_patterns", "gsis": "gsis", "attributes": "attributes", "relations": "relations"}[metric]
+        buckets = {t["name"]: len(t[key]) for t in idx.tables.values()}
+        counted = "access_patterns" if key == "access_patterns" else key
+    elif by == "index":
+        for p in pats:
+            k = p["index"] or "(table)"
+            buckets[k] = buckets.get(k, 0) + 1
+        counted = "access_patterns"
+    elif by == "operation":
+        for p in pats:
+            buckets[p["operation"]] = buckets.get(p["operation"], 0) + 1
+        counted = "access_patterns"
+    elif by == "repository":
+        for p in pats:
+            k = p["repository_file"] or "(none)"
+            buckets[k] = buckets.get(k, 0) + 1
+        counted = "access_patterns"
+    elif by == "entity":
+        for t in idx.tables.values():
+            for e in t["entities"]:
+                buckets[e] = buckets.get(e, 0) + 1
+        counted = "tables"
+    else:
+        for r in rels:
+            buckets[r["kind"]] = buckets.get(r["kind"], 0) + 1
+        counted = "relations"
+    return {"by": by, "metric": metric, "counted": counted, "buckets": dict(sorted(buckets.items())), "denominator": _dm_denominator(idx)}
+
+
+@_tool
+def dm_validate() -> dict[str, Any]:
+    """Data-model lint: tables with more than datamodel.max_gsis_per_table GSIs, Scan access
+    patterns, patterns naming an index the table lacks, relations to unknown tables or
+    attributes, GSI keys missing from `attributes`, repository files that do not exist."""
+    idx = _idx()
+    findings = dm.validate(idx.tables, idx.tables_raw_count, int(idx.cfg["datamodel"]["max_gsis_per_table"]), idx.root)
+    return {"findings": findings, "total": len(findings), "checked": _dm_denominator(idx)}
+
+
+def _dm_owner_file(idx: SpecIndex, name: str) -> Path:
+    t = idx.tables.get(name)
+    return idx.resolve(t["file"]) if t else idx.resolve(idx.cfg["datamodel"]["write_file"])
+
+
+@_tool
+def dm_upsert_table(table: dict[str, Any]) -> dict[str, Any]:
+    """Create or update a table record. `table` needs at least `name`; other fields are
+    merged over the existing record (lists replace, scalars overwrite). Written to the
+    JSON file that owns the table, or datamodel.write_file for a new table."""
+    idx = _idx()
+    if not isinstance(table, dict) or not table.get("name"):
+        raise SpecError("validation", "table.name is required")
+    name = str(table["name"])
+    path = _dm_owner_file(idx, name)
+    raw = dm.read_raw_tables(path)
+    action = "created"
+    for i, existing in enumerate(raw):
+        if existing.get("name") == name:
+            raw[i] = {**existing, **table}
+            action = "updated"
+            break
+    else:
+        raw.append(table)
+    dm.write_tables(path, raw)
+    idx.invalidate()
+    idx.ensure(force=True)
+    return {"action": action, "table": name, "file": rel(path, idx.root)}
+
+
+@_tool
+def dm_upsert_pattern(table: str, pattern: dict[str, Any]) -> dict[str, Any]:
+    """Add or replace one access pattern (matched by `pattern.name`) on an existing table,
+    written back to the table's JSON file. `pattern.operation` must be one of Query,
+    GetItem, BatchGet, Put, Update, Delete, Transact, Scan."""
+    idx = _idx()
+    if table not in idx.tables:
+        raise SpecError("not_found", f"table {table!r} not found", available=sorted(idx.tables)[:50])
+    if not isinstance(pattern, dict) or not pattern.get("name"):
+        raise SpecError("validation", "pattern.name is required")
+    op = str(pattern.get("operation") or "")
+    if op not in dm.OPERATIONS:
+        raise SpecError("validation", f"pattern.operation must be one of {list(dm.OPERATIONS)}")
+    path = _dm_owner_file(idx, table)
+    raw = dm.read_raw_tables(path)
+    rec = next(t for t in raw if t.get("name") == table)
+    pats = list(rec.get("access_patterns") or [])
+    action = "created"
+    for i, p in enumerate(pats):
+        if isinstance(p, dict) and p.get("name") == pattern["name"]:
+            pats[i] = {**p, **pattern}
+            action = "updated"
+            break
+    else:
+        pats.append(pattern)
+    rec["access_patterns"] = pats
+    dm.write_tables(path, raw)
+    idx.invalidate()
+    idx.ensure(force=True)
+    return {"action": action, "table": table, "pattern": pattern["name"], "file": rel(path, idx.root)}
 
 
 def main() -> None:
