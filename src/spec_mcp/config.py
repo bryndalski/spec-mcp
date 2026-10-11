@@ -48,6 +48,7 @@ DEFAULTS: dict[str, Any] = {
         "write_dir": "docs/design/views",
         "messages_file": "front-end/messages/pl.json",
     },
+    "records": {},
     "links_file": ".spec-links.json",
     "index_file": ".spec-index.json",
 }

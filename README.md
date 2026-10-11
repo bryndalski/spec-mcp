@@ -16,6 +16,9 @@ coverage report that always states its denominator.
   "is there already a component for X?" — and linted against disk, tokens and the index.
 - **Designs**: one JSON record per view (route, roles, flow, requirements, artboards,
   brief, components, acceptance, evidence) with status gates checked by `design_validate`.
+- **Records**: any JSON collection (`{"records": [...]}`) with a JSON Schema per record —
+  claims, campaigns, legal gaps, OKRs, cost lines — listed, filtered, aggregated and
+  written back only after validation.
 - **Coverage & validation**: which requirements have a status, a flow, a test, a doc;
   duplicate / dangling IDs; links to things that do not exist; data-model lint.
 
@@ -149,6 +152,12 @@ Claude Code). `SPEC_CONFIG` points at the config file; when it is missing, defau
 | `design_upsert(record)` | Merge by id into `write_dir/<id>.json` (pretty, stable key order). |
 | `design_validate(id=None)` | duotio-ui component not in registry; feature/new-duotio-ui without `path`; unknown requirement ids; ≥ designed: `artifact_url` and 390 light+dark artboards required; ≥ specified: non-empty `acceptance`; ≥ implemented: every `i18n_keys` entry resolvable in `messages_file`. |
 | `design_coverage()` | Records per status, components by source, denominators. |
+| `rec_collections()` | Configured record collections: count, files, schema, id field, file-level problems. |
+| `rec_list(collection, where, limit, fields)` | Records filtered by field equality (list fields match on containment), projected; `matched` vs `total`. |
+| `rec_get(collection, id)` | One record (not-found lists available ids). |
+| `rec_upsert(collection, record, file=None)` | Validate against the schema **before** writing; replace in place by id or append to `file` / `write_file` / the single matched file. Full replace, not merge. |
+| `rec_validate(collection=None)` | Schema violations with `json_path`, missing id, duplicate ids, empty/malformed files, missing schema; `checked` + `files` as denominator. |
+| `rec_aggregate(collection, by, metric="count"\|"sum:f"\|"avg:f", where)` | Group by a field (list fields count per element) with `denominator`. |
 
 Errors never raise: `{"error": {"category": "not_found|validation|io|config", "message", "retryable"}}`.
 Every list answer says what was scanned, so an empty result is distinguishable from
@@ -266,10 +275,40 @@ catch the drift (unknown index, missing repository file, Scan creeping in).
 (must exist in the registry) | `feature` | `new-duotio-ui` (both need `path`). Status is a
 ratchet: each step adds checks that `design_validate` enforces.
 
+### Records (read + write)
+
+Config, one entry per collection (paths relative to the project root):
+
+```json
+{
+  "records": {
+    "claims": {
+      "globs": ["docs/company/marketing/claims.json"],
+      "schema": "docs/company/marketing/schema/claims.schema.json",
+      "id_field": "id",
+      "write_file": "docs/company/marketing/claims.json"
+    },
+    "leads": {
+      "globs": ["docs/company/leads/*.json"],
+      "schema": "docs/company/leads/schema/lead.schema.json"
+    }
+  }
+}
+```
+
+File: `{"meta": {...}, "records": [ {...}, ... ]}` (a bare array is accepted when reading).
+Schema: JSON Schema 2020-12 for **one record**; `format: date` / `date-time` are checked.
+Whether extra fields are allowed is the schema's decision (`additionalProperties`), not the
+server's. When `globs` match several files, `write_file` is the default append target and
+`rec_upsert(..., file=...)` picks another (a new path is created). `spec_index` writes an
+`INDEX.md` into every directory holding records: one section per collection with the
+status distribution when records carry a `status` field.
+
 ### Non-destructive by design
 
 - Markdown is **never rewritten**. Writers (`req_upsert`, `flow_upsert`,
-  `spec_import_markdown`, `req_link`) only touch JSON collection files and the sidecar.
+  `spec_import_markdown`, `req_link`, `dm_upsert_*`, `design_upsert`, `rec_upsert`) only
+  touch JSON collection files and the sidecar.
 - An ID defined in markdown cannot be shadowed by a JSON write — the tool refuses with a
   `validation` error naming the file.
 - Links for markdown items live in `links_file` (`{"ACT-R1": {"flows": [], "docs": [],

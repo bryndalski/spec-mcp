@@ -23,6 +23,7 @@ from .errors import SpecError
 from .index import GENERATED_MARKER, SpecIndex
 from . import datamodel as dm
 from . import frontend as fe
+from . import records as rc
 from .jsonstore import merge_items, upsert_item
 from .parse import is_test_evidence, md_flow_to_item, md_requirement_to_item, rel
 
@@ -30,8 +31,9 @@ mcp = FastMCP(
     "spec",
     instructions=(
         "Project specification tools: searchable docs, user flows and requirements with "
-        "coverage and validation. Read-mostly; the only writers are req_upsert, req_link, "
-        "flow_upsert and spec_index, and they never rewrite prose files they did not create."
+        "coverage and validation, plus schema-validated record collections (rec_*). "
+        "Read-mostly; the only writers are req_upsert, req_link, flow_upsert, dm_upsert_*, "
+        "design_upsert, rec_upsert and spec_index, and they never rewrite prose files they did not create."
     ),
 )
 
@@ -95,7 +97,7 @@ def spec_config() -> dict[str, Any]:
         "config": cfg,
         "config_file": idx.cfg["_source"],
         "root": idx.cfg["_root"],
-        "counts": {"docs": idx.doc_files, "requirements": len(idx.requirements), "flows": len(idx.flows), "datamodel": len(idx.tables), "components": len(idx.components), "designs": len(idx.designs)},
+        "counts": {"docs": idx.doc_files, "requirements": len(idx.requirements), "flows": len(idx.flows), "datamodel": len(idx.tables), "components": len(idx.components), "designs": len(idx.designs), "records": {n: len(c.load()[0]) for n, c in rc.collections(idx.cfg).items()}},
         "files": {"requirements": idx.req_files, "flows": idx.flow_files, "datamodel": idx.dm_files, "components": idx.component_files, "component_index": idx.index_files, "designs": idx.design_files},
         "index_file": str(idx.cache_path),
         "index_age_seconds": idx.age_seconds(),
@@ -490,7 +492,9 @@ def spec_validate() -> dict[str, Any]:
 @_tool
 def spec_index() -> dict[str, Any]:
     """Force a rebuild of the index and regenerate INDEX.md in every requirements and flows
-    directory and in the data-model directory (marked as generated). Returns counts and paths."""
+    directory, in the data-model and designs directories, and in every directory holding a
+    record collection (one section per collection, with its status distribution). All marked
+    as generated. Returns counts and paths."""
     idx = _idx(force=True)
     written: list[str] = []
     req_dirs: dict[Path, list[dict[str, Any]]] = {}
@@ -528,9 +532,26 @@ def spec_index() -> dict[str, Any]:
         p = dm_dir / "INDEX.md"
         p.write_text(dm.render_index(list(idx.tables.values()), dm.all_relations(idx.tables), GENERATED_MARKER), encoding="utf-8")
         written.append(rel(p, idx.root))
+    rec_dirs: dict[Path, list[str]] = {}
+    rec_total = 0
+    for name, coll in rc.collections(idx.cfg).items():
+        rows, _ = coll.load()
+        if not rows:
+            continue
+        rec_total += len(rows)
+        by_dir: dict[Path, list[dict[str, Any]]] = {}
+        for r in rows:
+            by_dir.setdefault(idx.resolve(r["_file"]).parent, []).append(r)
+        for d, rs in by_dir.items():
+            rec_dirs.setdefault(d, []).extend(rc.render_index_section(coll, rs))
+    for d, section in rec_dirs.items():
+        p = d / "INDEX.md"
+        head = [f"<!-- {GENERATED_MARKER}; do not edit by hand -->", f"# Records index — {d.name}", ""]
+        p.write_text("\n".join(head + section).rstrip("\n") + "\n", encoding="utf-8")
+        written.append(rel(p, idx.root))
     idx.invalidate()
     idx.ensure(force=True)
-    return {"requirements": len(idx.requirements), "flows": len(idx.flows), "docs": idx.doc_files, "datamodel": len(idx.tables), "components": len(idx.components), "designs": len(idx.designs), "written": written}
+    return {"requirements": len(idx.requirements), "flows": len(idx.flows), "docs": idx.doc_files, "datamodel": len(idx.tables), "components": len(idx.components), "designs": len(idx.designs), "records": rec_total, "written": written}
 
 
 # ---------------------------------------------------------------- data model
@@ -985,6 +1006,96 @@ def design_coverage() -> dict[str, Any]:
         "components_by_source": dict(sorted(by_source.items())),
         "denominator": {"designs": len(idx.designs), "design_components": n_comp, "registry_components": len(idx.components)},
     }
+
+
+# ---------------------------------------------------------------- records
+
+
+@_tool
+def rec_collections() -> dict[str, Any]:
+    """List the configured record collections (`records.<name>` in the config): record
+    count, files matched, schema path, id field and file-level problems. Start here to learn
+    which collections exist before calling rec_list / rec_get / rec_upsert."""
+    idx = _idx()
+    items = []
+    for name, coll in sorted(rc.collections(idx.cfg).items()):
+        rows, problems = coll.load()
+        items.append({
+            "name": name, "records": len(rows), "files": [rc._rel(f, coll.root) for f in coll.files()],
+            "schema": coll.schema_path, "id_field": coll.id_field, "write_file": coll.write_file, "problems": problems,
+        })
+    return {"collections": items, "total": len(items)}
+
+
+@_tool
+def rec_list(collection: str, where: dict[str, Any] | None = None, limit: int = 100, fields: list[str] | None = None) -> dict[str, Any]:
+    """Records of one collection, filtered by field equality (`where`, a list-valued field
+    matches when it contains the value) and optionally projected to `fields`. Returns
+    `total` (all records in the collection) and `matched` (after the filter) so an empty
+    answer is distinguishable from an empty collection. Each record carries `_file`."""
+    idx = _idx()
+    coll = rc.get_collection(idx.cfg, collection)
+    rows, problems = coll.load()
+    hits = [r for r in rows if rc.matches(r, where)]
+    out = []
+    for r in hits[: max(0, limit)]:
+        rec = {k: v for k, v in r.items() if k != "_index"}
+        if fields:
+            rec = {k: rec[k] for k in [*fields, "_file"] if k in rec}
+        out.append(rec)
+    return {"collection": collection, "items": out, "matched": len(hits), "total": len(rows), "files": len(coll.files()), "problems": problems}
+
+
+@_tool
+def rec_get(collection: str, id: str) -> dict[str, Any]:
+    """One record by id (the collection's `id_field`). Not-found answers list up to 80
+    available ids."""
+    idx = _idx()
+    coll = rc.get_collection(idx.cfg, collection)
+    rows, _ = coll.load()
+    for r in rows:
+        if str(r.get(coll.id_field)) == str(id):
+            return {"collection": collection, "record": rc.strip_meta(r), "file": r["_file"]}
+    raise SpecError("not_found", f"{collection}: record {id!r} not found", available=sorted(str(r.get(coll.id_field)) for r in rows)[:80])
+
+
+@_tool
+def rec_upsert(collection: str, record: dict[str, Any], file: str | None = None) -> dict[str, Any]:
+    """Create or replace one record. The record is validated against the collection's JSON
+    Schema BEFORE anything is written; on failure nothing changes and the error lists every
+    violation with its `json_path`. An existing id is replaced in place (same file, same
+    position); a new record is appended to `file`, else `write_file`, else the single
+    matched file. Formatting: 2-space indent, UTF-8, trailing newline, `meta` preserved.
+    Unlike req_upsert/design_upsert this is a full replace, not a merge."""
+    idx = _idx()
+    coll = rc.get_collection(idx.cfg, collection)
+    result = coll.upsert(record, file)
+    return {"collection": collection, **result}
+
+
+@_tool
+def rec_validate(collection: str | None = None) -> dict[str, Any]:
+    """Validate one or every collection: schema violations (with json_path), missing id
+    field, duplicate ids, empty or malformed files, missing schema. Returns `checked`
+    (records) and `files` per collection as the denominator, and `errors` in total."""
+    idx = _idx()
+    cols = rc.collections(idx.cfg)
+    if collection is not None:
+        cols = {collection: rc.get_collection(idx.cfg, collection)}
+    results = [c.validate() for _, c in sorted(cols.items())]
+    return {"results": results, "checked": sum(r["checked"] for r in results), "collections": len(results), "errors": sum(len(r["errors"]) for r in results)}
+
+
+@_tool
+def rec_aggregate(collection: str, by: str, metric: str = "count", where: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Group records by a field (list-valued fields count once per element; missing →
+    "(none)") with metric `count`, `sum:<field>` or `avg:<field>` (non-numeric values are
+    skipped). `where` filters first. Returns `denominator` = records aggregated."""
+    idx = _idx()
+    coll = rc.get_collection(idx.cfg, collection)
+    rows, _ = coll.load()
+    hits = [r for r in rows if rc.matches(r, where)]
+    return {"collection": collection, **rc.aggregate(hits, by, metric), "total": len(rows)}
 
 
 def main() -> None:

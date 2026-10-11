@@ -1,12 +1,12 @@
 [project]
 name = "spec-mcp"
-version = "0.3.1"
-description = "MCP server for managing project docs, user flows and requirements with coverage and validation"
+version = "0.4.0"
+description = "MCP server for project docs, user flows, requirements, data model, UI registry, designs and schema-validated record collections"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 authors = [{ name = "Jakub Bryndal" }]
-dependencies = ["mcp>=2,<3"]
+dependencies = ["mcp>=2,<3", "jsonschema>=4.18"]
 
 [project.scripts]
 spec-mcp = "spec_mcp.server:main"
