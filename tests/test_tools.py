@@ -17,7 +17,7 @@ def svc(project: Path, monkeypatch):
 
 def test_spec_config_reports_counts(svc):
     out = server.spec_config()
-    assert out["counts"] == {"docs": 4, "requirements": 5, "flows": 2, "datamodel": 0}
+    assert out["counts"] == {"docs": 4, "requirements": 5, "flows": 2, "datamodel": 0, "components": 0, "designs": 0}
     assert out["config"]["requirements"]["write_file"] == "docs/requirements/requirements.json"
     assert "index_age_seconds" in out
 
@@ -180,8 +180,8 @@ def test_spec_index_writes_index_md(svc: Path):
     assert server.req_coverage()["total"] == 5
 
 
-def test_tool_registry_has_24_tools():
+def test_tool_registry_has_34_tools():
     names = sorted(server.mcp._tool_manager._tools)  # noqa: SLF001
-    assert len(names) == 24
+    assert len(names) == 34
     assert "spec_import_markdown" in names
     assert {"spec_config", "docs_search", "req_coverage", "spec_validate", "spec_index", "flow_upsert"} <= set(names)
