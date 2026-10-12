@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-Category = Literal["not_found", "validation", "io", "config"]
+Category = Literal[
+    "not_found",
+    "validation",
+    "io",
+    "config",
+    "ollama_unavailable",
+    "ollama_not_configured",
+    "model_missing",
+    "insufficient_evidence",
+]
 
 
 class SpecError(Exception):

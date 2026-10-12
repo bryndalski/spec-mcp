@@ -60,6 +60,7 @@ DEFAULTS: dict[str, Any] = {
         "messages_file": "front-end/messages/pl.json",
     },
     "records": {},
+    "ollama": {},
     "links_file": ".spec-links.json",
     "index_file": ".spec-index.json",
 }
@@ -103,6 +104,9 @@ def load_config(path: Path | None = None, root: Path | None = None) -> dict[str,
         except re.error as e:
             raise SpecError("config", f"{section}.{key} is not a valid regex: {e}") from e
     _validate_docs(cfg["docs"])
+    from .ollama import resolve_config as _resolve_ollama
+
+    cfg["_ollama"] = _resolve_ollama(cfg.get("ollama"))
     cfg["_root"] = str(root)
     cfg["_source"] = source
     return cfg

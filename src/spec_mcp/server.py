@@ -27,6 +27,7 @@ from . import records as rc
 from . import docscheck as dc
 from . import docswrite as dw
 from . import verify as vf
+from . import ollama as ol
 from .jsonstore import merge_items, upsert_item
 from .parse import ASYNC_RUNTIMES, is_test_evidence, md_flow_to_item, md_requirement_to_item, rel
 
@@ -38,17 +39,24 @@ mcp = FastMCP(
         "schema-validated record collections (rec_*). Read-mostly; the writers are req_upsert, "
         "req_link, flow_upsert, dm_upsert_*, design_upsert, rec_upsert, spec_index, "
         "docs_upsert / docs_supersede (front matter and archive moves only) and the explicit "
-        "fix=true of flow_verify / req_verify; they never rewrite prose they were not asked to."
+        "fix=true of flow_verify / req_verify; they never rewrite prose they were not asked to. "
+        "Optional local-RAG layer (needs an `ollama` config section): docs_ask answers a question "
+        "from the documentation with numbered citations, docs_semantic_search ranks chunks by "
+        "BM25 + embeddings, docs_reindex refreshes the embedding index, ollama_status checks "
+        "the server and models. Prefer docs_ask over reading files when you need to know how "
+        "something works; fall back to docs_search (BM25) when Ollama is down."
     ),
 )
 
 _index: SpecIndex | None = None
+_engine: ol.Engine | None = None
 
 
 def reset() -> None:
     """Drop the in-memory index (tests / config change)."""
-    global _index
+    global _index, _engine
     _index = None
+    _engine = None
 
 
 def _idx(force: bool = False) -> SpecIndex:
@@ -107,6 +115,7 @@ def spec_config() -> dict[str, Any]:
         "index_file": str(idx.cache_path),
         "index_age_seconds": idx.age_seconds(),
         "warnings": idx.warnings,
+        "ollama": {"configured": bool(idx.cfg.get("_ollama"))},
     }
 
 
@@ -1265,6 +1274,70 @@ def rec_aggregate(collection: str, by: str, metric: str = "count", where: dict[s
     rows, _ = coll.load()
     hits = [r for r in rows if rc.matches(r, where)]
     return {"collection": collection, **rc.aggregate(hits, by, metric), "total": len(rows)}
+
+
+# ---------------------------------------------------------------- local RAG (Ollama, optional)
+
+
+def _eng() -> ol.Engine:
+    """The Ollama engine for the current index; raises ollama_not_configured when the layer is off."""
+    global _engine
+    idx = _idx()
+    o = ol.require(idx.cfg)
+    if _engine is None or _engine.idx is not idx or _engine.o is not o:
+        _engine = ol.Engine(idx, o)
+    return _engine
+
+
+@_tool
+def ollama_status() -> dict[str, Any]:
+    """Health of the optional local-RAG layer: is the Ollama server reachable, are the configured
+    embedding and chat models pulled, how many chunks are embedded, how old the embedding index is
+    and how many items still wait for a vector. Call before docs_ask when answers fail; unlike the
+    other ollama tools it answers (available=false) instead of erroring when the server is down.
+    Not a retrieval tool: use docs_ask / docs_semantic_search for content."""
+    return _eng().status()
+
+
+@_tool
+def docs_reindex(scope: str = "all", force: bool = False) -> dict[str, Any]:
+    """(Re)build the embedding index used by docs_ask and docs_semantic_search. Incremental: only
+    items whose content hash changed are re-embedded, vanished items are removed, a changed
+    embed_model rebuilds everything. Indexed corpora come from `ollama.corpora`: documents whose
+    status is not hidden (superseded/historical stay BM25-only), flow steps, requirements, and
+    record collections. `scope` limits to one corpus ("docs", "flows", "requirements",
+    "records:<name>"); force=true drops all vectors first. Returns embedded / reused / removed
+    counts per corpus. Needs a running Ollama and the embed model pulled. Queries also refresh
+    small backlogs lazily (see lazy_embed_limit), so call this after bulk changes. Writes only the
+    sqlite cache file, never documentation."""
+    return _eng().reindex(scope=scope, force=force)
+
+
+@_tool
+def docs_semantic_search(query: str, limit: int = 10, corpus: str | None = None, include_stale: bool = False) -> dict[str, Any]:
+    """Hybrid retrieval: BM25 (saturated) blended with embedding cosine similarity using the
+    `ollama.hybrid` weights, over documents, flow steps, requirements and records. Finds
+    paraphrases docs_search (pure BM25 keywords) misses. Hits carry corpus, kind, file, heading
+    path, line range, status, score, score_bm25 and score_embed; documents with status
+    superseded/historical are hidden unless include_stale=true (then they appear BM25-only).
+    `corpus` narrows to docs | flows | requirements | records[:<name>]. Returns retrieval chunks
+    only; use docs_ask to get a written, cited answer. Needs Ollama for the query embedding."""
+    return _eng().semantic_search(query, limit, corpus, include_stale)
+
+
+@_tool
+def docs_ask(question: str, top_k: int = 8, corpus: str | None = None, include_stale: bool = False, strict: bool = True, model: str | None = None) -> dict[str, Any]:
+    """Ask the documentation a question in natural language and get a short Polish answer
+    generated by the local Ollama chat model strictly from retrieved sources, with [n]
+    citations. Returns answer, grounded, confidence (high|medium|low), numbered sources
+    (kind, path, heading, line range, status, score, and for flow/requirement sources an
+    evidence_ok check of file+symbol+line against the code), citations_valid (every [n] exists),
+    uncited_sentences, retrieval counts and latency. With strict=true (default) a question whose
+    best retrieval score is below `ollama.min_score` is NOT sent to the model and returns an
+    insufficient_evidence error with the nearest hits, so absence in the docs is explicit.
+    Prefer this over reading many files; verify only the cited lines you rely on. Differs from
+    docs_search/docs_semantic_search, which return chunks and never generate text."""
+    return _eng().ask(question, top_k, corpus, include_stale, strict, model)
 
 
 def main() -> None:

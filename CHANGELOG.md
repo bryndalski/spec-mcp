@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0 — 2026-10-11
+
+- **Optional local-RAG layer over Ollama** (45 → 49 tools): `ollama_status`, `docs_reindex`,
+  `docs_semantic_search`, `docs_ask`. Enabled by an `ollama` config section; without it the
+  tools answer `ollama_not_configured` and every 0.5.0 tool behaves as before.
+- `docs_ask`: hybrid retrieval (saturated BM25 + embedding cosine) -> numbered sources ->
+  Ollama chat answer with `[n]` citations. Returns `grounded`, `confidence`, `citations_valid`,
+  `uncited_sentences`, per-source `evidence_ok` (file + symbol + line checked against the code
+  for flow / requirement sources). `strict=true` refuses below `min_score` without calling the
+  model (`insufficient_evidence` + nearest hits).
+- Corpora: heading chunks of non-hidden documents, flow steps and async steps, requirements
+  (text + acceptance), records of configured collections (`records:<name>`). Superseded and
+  historical documents stay BM25-only (shown by `include_stale`).
+- Incremental sqlite embedding cache (`cache_path`): content-hash reuse, orphan removal, full
+  rebuild on `embed_model` change, lazy refresh of small backlogs (`lazy_embed_limit`).
+- Structured errors: `ollama_unavailable` (retryable, hint "start Ollama"), `model_missing`
+  (hint `ollama pull <model>`), `ollama_not_configured`, `insufficient_evidence`.
+- New dependency `httpx`; optional extra `fast` (`numpy`) for vector scans.
+- Measured on a 4 182-item real corpus: indexing 142 s (bge-m3), retrieval 140 ms pure Python /
+  17 ms with numpy, 10 000 x 1 024 cosine scan 241 ms / 3 ms.
+
 ## 0.5.0 — 2026-10-11
 
 - **Document status**: front matter (`status`, `topic`, `owner`, `supersedes`, `superseded_by`,
