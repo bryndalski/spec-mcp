@@ -415,7 +415,7 @@ def test_spec_index_writes_datamodel_index(svc: Path):
 
 def test_dm_tools_registered():
     names = sorted(server.mcp._tool_manager._tools)  # noqa: SLF001
-    assert len(names) == 45
+    assert len(names) == 49
     assert {
         "dm_tables",
         "dm_table",

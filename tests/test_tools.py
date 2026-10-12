@@ -180,8 +180,8 @@ def test_spec_index_writes_index_md(svc: Path):
     assert server.req_coverage()["total"] == 5
 
 
-def test_tool_registry_has_45_tools():
+def test_tool_registry_has_49_tools():
     names = sorted(server.mcp._tool_manager._tools)  # noqa: SLF001
-    assert len(names) == 45
+    assert len(names) == 49
     assert "spec_import_markdown" in names
     assert {"spec_config", "docs_search", "req_coverage", "spec_validate", "spec_index", "flow_upsert"} <= set(names)
