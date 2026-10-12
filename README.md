@@ -377,7 +377,7 @@ is ever written to your documents: the layer only retrieves and answers.
   "cache_path": ".spec-embeddings.sqlite",        // add to .gitignore
   "corpora": ["docs", "flows", "requirements", "records:routes"],
   "top_k": 8,
-  "min_score": 0.54,
+  "min_score": 0.54,                              // compared with the score before any boost
   "hybrid": { "bm25": 0.35, "embed": 0.65 },
   "timeout_s": 120, "keep_alive": "10m", "temperature": 0.1
 }
@@ -415,6 +415,47 @@ company) still scores 0.586, so treat `grounded=false` / "brak w dokumentacji" a
 line of defence. `qwen2.5:7b-instruct` is the fast option (`model="qwen2.5:7b-instruct"`) but
 cites far less. Vector scan: 10 000 x 1 024 in 241 ms in pure Python, 3 ms with the `fast`
 extra (`pip install spec-mcp[fast]`).
+
+#### Tuning retrieval
+
+All of these are optional and neutral until configured (except the generator prompt, see below).
+
+```jsonc
+"ollama": {
+  "rank":    { "status_boost": { "current": 1.0, "draft": 0.85, "unknown": 0.9 },
+               "kind_boost":   { "record": 1.1, "flow": 1.05 } },
+  "reserve": { "record": 2, "flow": 1 },        // guaranteed slots when the question names them
+  "route_terms": ["trasa", "endpoint", "route", "POST", "GET", "PATCH"],
+  "flow_terms":  ["flow", "krok", "proces"],
+  "list_terms":  ["które", "jakie", "lista", "wszystkie", "ile", "co nadal", "wymień"],
+  "top_k_list": 12,                              // list questions: max(top_k, min(top_k_list, 14))
+  "max_context_chars": 14000,
+  "route_structured": true,                      // run req_list / rec_aggregate for status/count questions
+  "system_prompt_file": "docs/prompt.txt"        // optional; replaces the built-in Polish prompt
+}
+```
+
+- **Boosts order, they never gate.** `rank_score = score x status_boost x kind_boost` decides the order;
+  `score` and the `min_score` comparison use the score before boosting. `status_boost.unknown` applies
+  to documents without a front-matter status only when `docs.require_front_matter` is true (otherwise
+  such documents count as `current`). `status_boost` applies to documents only (the `status` of a
+  requirement or record is domain data, not a document status); `kind_boost` applies to every kind.
+- **Reserved slots** trigger on the question text (`route_terms` -> `record`, `flow_terms` -> `flow`).
+  ALL-CAPS terms are case-sensitive whole words, other single words match by stem
+  (`trasa` ~ `trasy`, `trasach`), terms with spaces match as substrings. The candidate must already be
+  in the top 30 of the ranking.
+- **Structured routing** exists because embeddings do not carry fields such as `status`: "which
+  requirements are not implemented?" or "how many routes?" are answered by a record tool, not by
+  similarity. Patterns are `{pattern, tool, arguments, execute}`; defaults cover not-implemented /
+  drifted requirements, route counts (`rec_aggregate` on collection `routes`) and route roles (hint
+  only). The suggested call is always returned as `suggested_tool`; the server only executes it with
+  `route_structured: true`, read-only, at most 50 rows, and the result counts as evidence for the
+  `min_score` gate.
+- **The 0.7.0 default prompt is stricter about completeness and negative facts.** To keep the 0.6.0
+  wording set `system_prompt` to it explicitly.
+- `partial_gap` / `consistency_warning` are heuristics (>= 2 shared 4+ letter tokens between the
+  question and the "Brak w dokumentacji" sentence); treat them as a prompt to read the answer twice,
+  not as a verdict.
 
 ### Non-destructive by design
 

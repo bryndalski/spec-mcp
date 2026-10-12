@@ -57,18 +57,88 @@ OLLAMA_DEFAULTS: dict[str, Any] = {
     "lazy_embed_limit": 200,
     "embed_query_prefix": "",
     "embed_doc_prefix": "",
+    # --- 0.7.0 retrieval tuning (all neutral unless configured) ---
+    # Multipliers applied to the hybrid score for ordering only; `min_score` is always compared
+    # with the score BEFORE boosting. Missing keys mean 1.0.
+    "rank": {"status_boost": {}, "kind_boost": {}},
+    # Guaranteed slots per kind group (record|flow|requirement|doc) when the question names it.
+    "reserve": {},
+    "route_terms": ["trasa", "endpoint", "route", "POST", "GET", "PATCH"],
+    "flow_terms": ["flow", "krok", "proces"],
+    "list_terms": [
+        "które",
+        "jakie",
+        "lista",
+        "wszystkie",
+        "ile",
+        "co nadal",
+        "wymień",
+    ],
+    "top_k_list": 12,
+    "max_context_chars": 14000,
+    "system_prompt": None,
+    "system_prompt_file": None,
+    "structured_patterns": None,  # None -> DEFAULT_STRUCTURED_PATTERNS
+    "route_structured": False,
 }
 
 _ALLOWED_KEYS = set(OLLAMA_DEFAULTS)
 _CORPUS_RE = re.compile(r"^(docs|flows|requirements|records:[A-Za-z0-9_.\-]+)$")
+_KIND_GROUPS = ("record", "flow", "requirement", "doc")
+_KIND_TO_GROUP = {
+    "record": "record",
+    "flow_step": "flow",
+    "flow_async": "flow",
+    "requirement": "requirement",
+    "doc": "doc",
+}
+_STRUCTURED_TOOLS = ("req_list", "rec_list", "rec_aggregate")
+STRUCTURED_LIMIT = 50
+LIST_TOP_K_CAP = 14
+
+DEFAULT_STRUCTURED_PATTERNS: list[dict[str, Any]] = [
+    {
+        "pattern": r"not[_ ]implemented|nie\s*zaimplementowan\w*|niezrealizowan\w*",
+        "tool": "req_list",
+        "arguments": {"status": "not_implemented"},
+        "execute": True,
+    },
+    {
+        "pattern": r"drifted|dryf\w*|rozjech\w*",
+        "tool": "req_list",
+        "arguments": {"status": "drifted"},
+        "execute": True,
+    },
+    {
+        "pattern": r"\b(ile|liczb\w*)\b[^?]{0,40}\b(tras\w*|endpoint\w*|route\w*)",
+        "tool": "rec_aggregate",
+        "arguments": {"collection": "routes", "by": "kind"},
+        "execute": True,
+    },
+    {
+        "pattern": r"\brol\w*\b[^?]{0,40}\b(tras\w*|endpoint\w*|route\w*)",
+        "tool": "rec_list",
+        "arguments": {
+            "collection": "routes",
+            "fields": ["id", "roles", "file", "line"],
+        },
+        "execute": False,
+    },
+]
 
 # Test hook: an httpx transport (e.g. MockTransport) used instead of the network.
 _TRANSPORT: httpx.BaseTransport | None = None
 
 SYSTEM_PROMPT = (
     "Odpowiadaj WYŁĄCZNIE na podstawie źródeł [n]. Każde twierdzenie z odwołaniem [n]. "
-    "Jeśli źródła nie wystarczają — napisz »brak w dokumentacji« i wskaż czego brakuje. "
-    "Nie zgaduj. Odpowiadaj po polsku, zwięźle."
+    "Nie zgaduj. Odpowiadaj po polsku, zwięźle.\n"
+    "Odpowiedz na KAŻDĄ część pytania osobno. Dla części bez źródła napisz jedynie "
+    "»Brak w dokumentacji: <czego brakuje>«; NIE dopisuj tego zdania, jeśli odpowiedź jest kompletna.\n"
+    "Jeśli źródła wprost stwierdzają brak (np. »0 trafień«, »nie istnieje«, »brak«, »bez wywołań«), "
+    "odpowiedz tym faktem (»Nie — …«), nie odmawiaj; »brak w dokumentacji« jest tylko dla sytuacji, "
+    "gdy źródła w ogóle nie dotyczą pytania.\n"
+    "Nie wymieniaj jako działających rzeczy, które źródło opisuje jako istniejące, ale niewywoływane, "
+    "wyłączone lub bez wywołań — wskaż ich status."
 )
 
 _CITE = re.compile(r"\[(\d+(?:\s*[,;]\s*\d+)*)\]")
@@ -101,6 +171,15 @@ def resolve_config(raw: Any) -> dict[str, Any] | None:
             if bad:
                 raise SpecError("config", f"ollama.hybrid: unknown keys {bad}")
             cfg["hybrid"] = {**cfg["hybrid"], **v}
+        elif k == "rank":
+            if not isinstance(v, dict):
+                raise SpecError(
+                    "config", "ollama.rank must be an object {status_boost, kind_boost}"
+                )
+            bad = sorted(set(v) - {"status_boost", "kind_boost"})
+            if bad:
+                raise SpecError("config", f"ollama.rank: unknown keys {bad}")
+            cfg["rank"] = {**cfg["rank"], **v}
         else:
             cfg[k] = v
     for k in (
@@ -163,7 +242,84 @@ def resolve_config(raw: Any) -> dict[str, Any] | None:
         raise SpecError("config", "ollama.hybrid weights must not both be zero")
     if cfg["bm25_saturation"] <= 0:
         raise SpecError("config", "ollama.bm25_saturation must be > 0")
+    _validate_tuning(cfg)
     return cfg
+
+
+def _validate_tuning(cfg: dict[str, Any]) -> None:
+    """0.7.0 keys: rank, reserve, term lists, top_k_list, max_context_chars, prompt, routing."""
+    rank = cfg["rank"]
+    for part, allowed in (("status_boost", None), ("kind_boost", _KIND_GROUPS)):
+        m = rank.get(part, {})
+        if not isinstance(m, dict):
+            raise SpecError("config", f"ollama.rank.{part} must be an object")
+        for key, val in m.items():
+            if allowed is not None and key not in allowed:
+                raise SpecError(
+                    "config",
+                    f"ollama.rank.{part}: unknown kind {key!r}",
+                    allowed=list(allowed),
+                )
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0:
+                raise SpecError(
+                    "config",
+                    f"ollama.rank.{part}.{key} must be a non-negative number",
+                )
+    reserve = cfg["reserve"]
+    if not isinstance(reserve, dict):
+        raise SpecError("config", "ollama.reserve must be an object {kind: slots}")
+    for key, val in reserve.items():
+        if key not in _KIND_GROUPS:
+            raise SpecError(
+                "config",
+                f"ollama.reserve: unknown kind {key!r}",
+                allowed=list(_KIND_GROUPS),
+            )
+        if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+            raise SpecError(
+                "config", f"ollama.reserve.{key} must be a non-negative integer"
+            )
+    for k in ("route_terms", "flow_terms", "list_terms"):
+        v = cfg[k]
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            raise SpecError("config", f"ollama.{k} must be a list of non-empty strings")
+    for k in ("top_k_list", "max_context_chars"):
+        if (
+            not isinstance(cfg[k], int)
+            or isinstance(cfg[k], bool)
+            or cfg[k] < (1 if k == "top_k_list" else 200)
+        ):
+            raise SpecError("config", f"ollama.{k} must be a positive integer")
+    for k in ("system_prompt", "system_prompt_file"):
+        if cfg[k] is not None and (not isinstance(cfg[k], str) or not cfg[k].strip()):
+            raise SpecError("config", f"ollama.{k} must be a non-empty string or null")
+    if not isinstance(cfg["route_structured"], bool):
+        raise SpecError("config", "ollama.route_structured must be a boolean")
+    pats = cfg["structured_patterns"]
+    if pats is not None:
+        if not isinstance(pats, list):
+            raise SpecError(
+                "config", "ollama.structured_patterns must be a list of objects"
+            )
+        for i, p in enumerate(pats):
+            if (
+                not isinstance(p, dict)
+                or not isinstance(p.get("pattern"), str)
+                or p.get("tool") not in _STRUCTURED_TOOLS
+                or not isinstance(p.get("arguments", {}), dict)
+                or not isinstance(p.get("execute", True), bool)
+            ):
+                raise SpecError(
+                    "config",
+                    f"ollama.structured_patterns[{i}] needs pattern (regex), tool "
+                    f"({'|'.join(_STRUCTURED_TOOLS)}), arguments (object), optional execute (bool)",
+                )
+            try:
+                re.compile(p["pattern"])
+            except re.error as e:
+                raise SpecError(
+                    "config", f"ollama.structured_patterns[{i}].pattern: {e}"
+                ) from e
 
 
 def require(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -746,6 +902,17 @@ class Engine:
                 out[k] = _dot(v, qvec)
         return out
 
+    def _boost(self, it: dict[str, Any]) -> float:
+        rank = self.o["rank"]
+        kind_boost = rank.get("kind_boost") or {}
+        status_boost = rank.get("status_boost") or {}
+        group = _KIND_TO_GROUP.get(it["kind"], it["kind"])
+        mult = float(kind_boost.get(group, 1.0))
+        if it["kind"] == "doc":  # document status only; requirement/record statuses are domain data
+            st = it.get("status") or "unknown"
+            mult *= float(status_boost.get(st, 1.0))
+        return mult
+
     def rank(
         self,
         query: str,
@@ -754,6 +921,10 @@ class Engine:
         include_stale: bool,
         limit: int,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Hybrid ranking. `score` is the raw hybrid score (what `min_score` is compared with);
+        `rank_score` = score x kind/status boost and only decides the ORDER. Optional reserved
+        slots (`ollama.reserve`) guarantee the best records/flow steps a place in the result when the
+        question names them."""
         items = self.items()
         toks = tokenize(query)
         bm_scores: dict[int, float] = {}
@@ -764,7 +935,7 @@ class Engine:
         wb, we = float(self.o["hybrid"]["bm25"]), float(self.o["hybrid"]["embed"])
         total_w = wb + we
         sat = float(self.o["bm25_saturation"])
-        scored: list[tuple[float, int, float, float]] = []
+        scored: list[tuple[float, float, int, float, float]] = []
         pool = 0
         for i, it in enumerate(items):
             if it["hidden"] and not include_stale:
@@ -779,19 +950,52 @@ class Engine:
             e = max(0.0, cos.get(it["key"], 0.0))
             score = (wb * b_norm + we * e) / total_w
             if score > 0:
-                scored.append((score, i, b, e))
-        scored.sort(key=lambda t: (-t[0], t[1]))
-        hits = []
-        for score, i, b, e in scored[: max(1, limit)]:
-            it = items[i]
-            hits.append(
-                {
-                    **it,
-                    "score": round(score, 4),
-                    "score_bm25": round(b, 3),
-                    "score_embed": round(e, 4),
-                }
-            )
+                scored.append((score * self._boost(it), score, i, b, e))
+        scored.sort(key=lambda t: (-t[0], t[2]))
+
+        def mk(t: tuple[float, float, int, float, float], reserved: bool = False) -> dict[str, Any]:
+            rank_score, score, i, b, e = t
+            h = {
+                **items[i],
+                "score": round(score, 4),
+                "rank_score": round(rank_score, 4),
+                "score_bm25": round(b, 3),
+                "score_embed": round(e, 4),
+            }
+            if reserved:
+                h["reserved"] = True
+            return h
+
+        k = max(1, limit)
+        top = list(scored[:k])
+        reserved_idx: set[int] = set()
+        for group, slots in sorted((self.o.get("reserve") or {}).items()):
+            if slots <= 0 or not self._question_names(query, group):
+                continue
+            window = [t for t in scored[:30] if _KIND_TO_GROUP.get(items[t[2]]["kind"]) == group]
+            have = sum(1 for t in top if _KIND_TO_GROUP.get(items[t[2]]["kind"]) == group)
+            for cand in window:
+                if have >= slots:
+                    break
+                if cand in top:
+                    continue
+                # drop the weakest hit that is neither of this group nor already reserved
+                victim = None
+                for t in reversed(top):
+                    if (
+                        _KIND_TO_GROUP.get(items[t[2]]["kind"]) != group
+                        and t[2] not in reserved_idx
+                    ):
+                        victim = t
+                        break
+                if victim is None:
+                    break
+                top.remove(victim)
+                top.append(cand)
+                reserved_idx.add(cand[2])
+                have += 1
+            top.sort(key=lambda t: (-t[0], t[2]))
+        hits = [mk(t, reserved=t[2] in reserved_idx) for t in top]
         meta = {
             "searched_chunks": pool,
             "embedded_chunks": len(self._load_vectors()),
@@ -799,6 +1003,13 @@ class Engine:
             "hybrid": {"bm25": wb, "embed": we},
         }
         return hits, meta
+
+    def _question_names(self, query: str, group: str) -> bool:
+        if group == "record":
+            return term_hit(query, self.o["route_terms"])
+        if group == "flow":
+            return term_hit(query, self.o["flow_terms"])
+        return False
 
     # ------------------------------------------------------------ public ops
 
@@ -828,6 +1039,108 @@ class Engine:
             "pending_embeddings": fresh["pending"],
         }
 
+    def _system_prompt(self) -> str:
+        if self.o.get("system_prompt"):
+            return str(self.o["system_prompt"])
+        f = self.o.get("system_prompt_file")
+        if f:
+            path = self.idx.resolve(f)
+            try:
+                return path.read_text(encoding="utf-8").strip()
+            except OSError as e:
+                raise SpecError(
+                    "config", f"ollama.system_prompt_file not readable: {e}"
+                ) from e
+        return SYSTEM_PROMPT
+
+    def _structured(self, route: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Run the suggested structured tool read-only; return (result, pseudo hit)."""
+        tool, args = route["tool"], route["arguments"]
+        lim = STRUCTURED_LIMIT
+        if tool == "req_list":
+            status = args.get("status")
+            domain = args.get("domain")
+            rows = [
+                r
+                for r in self.idx.requirements.values()
+                if (not domain or r.get("domain") == domain)
+                and (not status or str(r.get("status") or "").upper() == str(status).upper())
+            ]
+            total_all = len(self.idx.requirements)
+            lines = [
+                f"{r['id']} [{r.get('domain')}] {r.get('title') or r['text'][:100]} — status: {r.get('status') or 'brak'} ({r['file']}:{r.get('line')})"
+                for r in rows[:lim]
+            ]
+            head = f"Wynik narzędzia req_list({_args_str(args)}): {len(rows)} pasujących z {total_all} wymagań."
+            result: dict[str, Any] = {
+                "tool": tool,
+                "arguments": args,
+                "total": total_all,
+                "matched": len(rows),
+                "items": [
+                    {"id": r["id"], "domain": r.get("domain"), "status": r.get("status"), "file": r["file"]}
+                    for r in rows[:lim]
+                ],
+            }
+        elif tool == "rec_list":
+            coll = rc.get_collection(self.idx.cfg, args["collection"])
+            all_rows, _ = coll.load()
+            rows = [r for r in all_rows if rc.matches(r, args.get("where"))]
+            fields = args.get("fields")
+            proj = []
+            for r in rows[:lim]:
+                rec = {k: v for k, v in r.items() if k != "_index"}
+                if fields:
+                    rec = {k: rec[k] for k in fields if k in rec}
+                proj.append(rec)
+            lines = [json.dumps(x, ensure_ascii=False) for x in proj]
+            head = f"Wynik narzędzia rec_list({_args_str(args)}): {len(rows)} pasujących z {len(all_rows)} rekordów."
+            result = {
+                "tool": tool,
+                "arguments": args,
+                "total": len(all_rows),
+                "matched": len(rows),
+                "items": proj,
+            }
+        else:  # rec_aggregate
+            coll = rc.get_collection(self.idx.cfg, args["collection"])
+            all_rows, _ = coll.load()
+            rows = [r for r in all_rows if rc.matches(r, args.get("where"))]
+            agg = rc.aggregate(rows, args["by"], args.get("metric", "count"))
+            lines = [f"{k}: {v}" for k, v in agg["groups"].items()]
+            head = (
+                f"Wynik narzędzia rec_aggregate({_args_str(args)}): grupy wg `{agg['by']}` "
+                f"(mianownik {agg['denominator']} z {len(all_rows)} rekordów)."
+            )
+            result = {
+                "tool": tool,
+                "arguments": args,
+                "total": len(all_rows),
+                "groups": agg["groups"],
+                "denominator": agg["denominator"],
+            }
+        text = head + ("\n" + "\n".join(lines) if lines else "\n(brak rekordów)")
+        pseudo = {
+            "key": f"structured:{tool}",
+            "corpus": "structured",
+            "kind": "structured",
+            "file": f"tool:{tool}",
+            "heading": f"{tool}({_args_str(args)})",
+            "path": f"wynik narzędzia > {tool}",
+            "line": None,
+            "line_end": None,
+            "status": None,
+            "hidden": False,
+            "embeddable": False,
+            "text": text,
+            "evidence": [],
+            "score": 1.0,
+            "rank_score": 1.0,
+            "score_bm25": 0.0,
+            "score_embed": 0.0,
+        }
+        return result, pseudo
+
     def ask(
         self,
         question: str,
@@ -839,25 +1152,56 @@ class Engine:
     ) -> dict[str, Any]:
         t0 = time.time()
         k = int(top_k or self.o["top_k"])
+        list_q = is_list_question(question, self.o["list_terms"])
+        if list_q:
+            k = max(k, min(int(self.o["top_k_list"]), LIST_TOP_K_CAP))
+        route = structured_route(
+            question,
+            self.o["structured_patterns"] or DEFAULT_STRUCTURED_PATTERNS,
+            self.idx.cfg,
+        )
+        structured_result: dict[str, Any] | None = None
+        structured_hit: dict[str, Any] | None = None
+        structured_error: dict[str, Any] | None = None
+        if route and route["execute"] and self.o["route_structured"]:
+            try:
+                structured_result, structured_hit = self._structured(route)
+            except SpecError as e:
+                structured_error = e.to_dict()["error"]
         client = OllamaClient(self.o)
         try:
             fresh = self._ensure_fresh(client)
             qvec = self._query_vec(client, question)
             hits, meta = self.rank(question, qvec, corpus, include_stale, k)
-            best = hits[0]["score"] if hits else 0.0
+            if structured_hit is not None:
+                hits = [structured_hit] + hits
+            best = max((h["score"] for h in hits), default=0.0)
             min_score = float(self.o["min_score"])
             retrieval = {
                 k2: v
                 for k2, v in meta.items()
                 if k2 in ("searched_chunks", "embedded_chunks", "hybrid")
             }
-            base = {
+            base: dict[str, Any] = {
                 "question": question,
                 "retrieval": retrieval,
                 "stale_index": fresh["index_stale"],
                 "min_score": min_score,
                 "best_score": best,
+                "top_k_used": k,
+                "list_question": list_q,
+                "route_hint": "structured" if route else None,
             }
+            if route:
+                base["suggested_tool"] = {
+                    "tool": route["tool"],
+                    "arguments": route["arguments"],
+                    "executed": structured_result is not None,
+                }
+            if structured_result is not None:
+                base["structured_result"] = structured_result
+            if structured_error is not None:
+                base["structured_error"] = structured_error
             if strict and (not hits or best < min_score):
                 return {
                     "error": {
@@ -871,9 +1215,14 @@ class Engine:
                     "latency_ms": int((time.time() - t0) * 1000),
                 }
             used_model = model or self.o["chat_model"]
+            hits, truncated = _fit_context(
+                hits,
+                int(self.o["source_max_chars"]),
+                int(self.o["max_context_chars"]),
+            )
             sources = _number_sources(hits)
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self._system_prompt()},
                 {
                     "role": "user",
                     "content": _user_prompt(
@@ -890,6 +1239,7 @@ class Engine:
         cited = sorted({n for grp in cites for n in grp})
         valid = all(1 <= n <= len(sources) for n in cited)
         no_answer = bool(_NO_ANSWER.search(answer))
+        partial_gap, consistency_warning = _gap_consistency(answer, question)
         uncited = uncited_sentences(answer)
         grounded = (
             bool(hits)
@@ -899,7 +1249,7 @@ class Engine:
         )
         above = sum(1 for h in hits if h["score"] >= min_score)
         margin = float(self.o["confidence_margin"])
-        if not grounded or no_answer:
+        if not grounded or (no_answer and not partial_gap):
             confidence = "low"
         elif best >= min_score + margin and above >= 2:
             confidence = "high"
@@ -923,6 +1273,9 @@ class Engine:
             "citations_valid": valid,
             "uncited_sentences": uncited,
             "no_answer": no_answer,
+            "partial_gap": partial_gap,
+            "consistency_warning": consistency_warning,
+            "context_truncated": truncated,
             "model": used_model,
             "latency_ms": int((time.time() - t0) * 1000),
             **({"index_hint": fresh["hint"]} if fresh.get("hint") else {}),
@@ -992,6 +1345,81 @@ def _has_model(names: list[str], want: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------- question classification
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"\w+", text, flags=re.UNICODE)
+
+
+def term_hit(query: str, terms: list[str]) -> bool:
+    """True when the question contains one of `terms`. ALL-CAPS terms (HTTP verbs) match as exact,
+    case-sensitive words; other single words match by stem (Polish inflection: `trasa` ~ `trasy`,
+    `trasach`); terms with spaces match as substrings of the lower-cased question."""
+    words = _words(query)
+    lowered = [w.lower() for w in words]
+    q = query.lower()
+    for term in terms:
+        if " " in term.strip():
+            if term.lower() in q:
+                return True
+        elif term.isupper() and len(term) > 1:
+            if term in words:
+                return True
+        else:
+            t = term.lower()
+            stem = t if len(t) <= 4 else t[: max(4, len(t) - 1)]
+            if len(t) <= 4:
+                if t in lowered:
+                    return True
+            elif any(w.startswith(stem) for w in lowered):
+                return True
+    return False
+
+
+def is_list_question(query: str, terms: list[str]) -> bool:
+    return term_hit(query, terms)
+
+
+def structured_route(
+    question: str, patterns: list[dict[str, Any]], cfg: dict[str, Any]
+) -> dict[str, Any] | None:
+    """First configured pattern that matches the question and whose tool target exists."""
+    for p in patterns:
+        if not re.search(p["pattern"], question, flags=re.IGNORECASE):
+            continue
+        tool = p["tool"]
+        args = dict(p.get("arguments") or {})
+        coll = args.get("collection")
+        if tool in ("rec_list", "rec_aggregate") and coll not in rc.collections(cfg):
+            continue  # the target collection does not exist in this project
+        return {
+            "tool": tool,
+            "arguments": args,
+            "execute": bool(p.get("execute", True)),
+            "pattern": p["pattern"],
+        }
+    return None
+
+
+def _gap_consistency(answer: str, question: str) -> tuple[bool, bool]:
+    """(partial_gap, consistency_warning). partial_gap: substantive content AND a trailing
+    »Brak w dokumentacji: …« sentence. consistency_warning: that gap sentence is about the same
+    entity as the question (>= 2 shared tokens of 4+ letters), i.e. it may contradict the answer."""
+    sents = _sentences(answer)
+    gap = [s for s in sents if _NO_ANSWER.search(s)]
+    body = [s for s in sents if not _NO_ANSWER.search(s) and len(s) >= 25]
+    if not gap or not body:
+        return False, False
+
+    def toks(t: str) -> set[str]:
+        return {w.lower() for w in _words(t) if len(w) >= 4}
+
+    qt = toks(question)
+    gt = toks(_NO_ANSWER.sub(" ", gap[-1])) - {"brak", "dokumentacji"}
+    return True, len(qt & gt) >= 2
+
+
 # ---------------------------------------------------------------- answer helpers
 
 
@@ -1009,6 +1437,10 @@ def _public_hit(h: dict[str, Any], with_snippet: bool = False) -> dict[str, Any]
         "score_bm25": h["score_bm25"],
         "score_embed": h["score_embed"],
     }
+    if abs(h.get("rank_score", h["score"]) - h["score"]) > 1e-9:
+        out["rank_score"] = h["rank_score"]
+    if h.get("reserved"):
+        out["reserved"] = True
     if with_snippet:
         t = h["text"]
         out["snippet"] = t[:240] + ("…" if len(t) > 240 else "")
@@ -1016,8 +1448,9 @@ def _public_hit(h: dict[str, Any], with_snippet: bool = False) -> dict[str, Any]
 
 
 def _number_sources(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
+    out = []
+    for i, h in enumerate(hits, start=1):
+        src = {
             "n": i,
             "kind": h["kind"],
             "corpus": h["corpus"],
@@ -1028,8 +1461,41 @@ def _number_sources(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "status": h["status"],
             "score": h["score"],
         }
-        for i, h in enumerate(hits, start=1)
-    ]
+        if h.get("reserved"):
+            src["reserved"] = True
+        out.append(src)
+    return out
+
+
+def _args_str(args: dict[str, Any]) -> str:
+    return ", ".join(f"{k}={v}" for k, v in args.items())
+
+
+def _fit_context(
+    hits: list[dict[str, Any]], source_max: int, budget: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """Drop the weakest hits until the prompt context fits `budget` characters. Structured tool
+    results and reserved record/flow hits are dropped last."""
+
+    def size(h: dict[str, Any]) -> int:
+        return min(len(h["text"]), source_max) + 160
+
+    kept = list(hits)
+    truncated = False
+    while len(kept) > 1 and sum(size(h) for h in kept) > budget:
+        victim = next(
+            (
+                h
+                for h in reversed(kept)
+                if not h.get("reserved") and h["kind"] != "structured"
+            ),
+            None,
+        )
+        if victim is None:
+            break
+        kept.remove(victim)
+        truncated = True
+    return kept, truncated
 
 
 def _user_prompt(question: str, hits: list[dict[str, Any]], max_chars: int) -> str:

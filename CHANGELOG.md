@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.7.0 — 2026-10-12
+
+Retrieval tuning for `docs_semantic_search` / `docs_ask`, driven by a 24-question evaluation on a
+real 4 182-item corpus. Every new key is optional; without configuration only the default
+generator prompt changed (see below). Tool count unchanged (49).
+
+- **`ollama.rank`**: `status_boost` (per document status, `unknown` = no front-matter status when
+  `docs.require_front_matter` is on) and `kind_boost` (`record|flow|requirement|doc`) multiply the
+  hybrid score for ORDERING only (`rank_score`). `min_score` and the reported `score` always use the
+  score before boosting, so tuning the order never changes the refusal gate.
+- **`ollama.reserve`** + `route_terms` / `flow_terms`: when the question names routes (or flows),
+  the best `record` (flow-step) hits found in the top 30 are guaranteed slots in the result
+  (`reserved: true`), replacing the weakest other hit.
+- **Adaptive `top_k`**: list-type questions (`list_terms`) use `max(top_k, min(top_k_list, 14))`;
+  `max_context_chars` (default 14000) drops the weakest sources, never reserved or structured ones
+  (`context_truncated`).
+- **Generator prompt** (new default, override with `system_prompt` / `system_prompt_file`): answer
+  every part of the question, append "Brak w dokumentacji: …" only for parts without a source, state
+  explicit absences ("0 trafień", "nie istnieje") as a fact instead of refusing, and never list
+  things the sources describe as existing-but-uncalled/disabled as working.
+- **Post-check**: `partial_gap` (content AND a "Brak w dokumentacji" line) and
+  `consistency_warning` (the gap line is about the same entity as the question). A partial gap no
+  longer forces `confidence: low`.
+- **Structured routing**: `route_hint: "structured"` + `suggested_tool` (`req_list`,
+  `rec_list`, `rec_aggregate` with ready arguments) for status / count / role questions
+  (`structured_patterns`, defaults included; patterns whose collection does not exist are skipped).
+  With `route_structured: true` the server runs the tool read-only and feeds its result to the
+  generator as source `[1]` (`structured_result`, at most 50 rows).
+
 ## 0.6.0 — 2026-10-11
 
 - **Optional local-RAG layer over Ollama** (45 → 49 tools): `ollama_status`, `docs_reindex`,

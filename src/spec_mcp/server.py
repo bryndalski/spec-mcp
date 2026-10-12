@@ -1332,7 +1332,12 @@ def docs_ask(question: str, top_k: int = 8, corpus: str | None = None, include_s
     citations. Returns answer, grounded, confidence (high|medium|low), numbered sources
     (kind, path, heading, line range, status, score, and for flow/requirement sources an
     evidence_ok check of file+symbol+line against the code), citations_valid (every [n] exists),
-    uncited_sentences, retrieval counts and latency. With strict=true (default) a question whose
+    uncited_sentences, partial_gap / consistency_warning (a "Brak w dokumentacji" line next to a
+    substantive answer about the same entity), retrieval counts and latency. Questions about
+    structured fields (status, counts, roles) return route_hint="structured" and a suggested_tool
+    (req_list / rec_list / rec_aggregate with ready arguments); with `ollama.route_structured` the
+    server runs it and feeds the result in as source [1]. List-type questions widen top_k and
+    reserved slots keep route/flow records visible. With strict=true (default) a question whose
     best retrieval score is below `ollama.min_score` is NOT sent to the model and returns an
     insufficient_evidence error with the nearest hits, so absence in the docs is explicit.
     Prefer this over reading many files; verify only the cited lines you rely on. Differs from
