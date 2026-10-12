@@ -1,6 +1,6 @@
 [project]
 name = "spec-mcp"
-version = "0.7.0"
+version = "0.7.1"
 description = "MCP server for project docs, user flows, requirements, data model, UI registry, designs and schema-validated record collections, optional local-RAG over Ollama"
 readme = "README.md"
 license = "MIT"

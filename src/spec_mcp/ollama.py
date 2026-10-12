@@ -81,6 +81,8 @@ OLLAMA_DEFAULTS: dict[str, Any] = {
     "system_prompt_file": None,
     "structured_patterns": None,  # None -> DEFAULT_STRUCTURED_PATTERNS
     "route_structured": False,
+    # --- 0.7.1 ---
+    "normalize_answers": True,  # collapse repeated "Brak w dokumentacji" lines deterministically
 }
 
 _ALLOWED_KEYS = set(OLLAMA_DEFAULTS)
@@ -141,10 +143,16 @@ SYSTEM_PROMPT = (
     "odpowiedz tym faktem (»Nie — …«), nie odmawiaj; »brak w dokumentacji« jest tylko dla sytuacji, "
     "gdy źródła w ogóle nie dotyczą pytania.\n"
     "Nie wymieniaj jako działających rzeczy, które źródło opisuje jako istniejące, ale niewywoływane, "
-    "wyłączone lub bez wywołań — wskaż ich status."
+    "wyłączone lub bez wywołań — wskaż ich status.\n"
+    "Źródło oznaczone [S] to wynik narzędzia strukturalnego (dokładne liczby i listy) — cytuj je jako [S]. "
+    "Nie powtarzaj ani nie parafrazuj pytania w odpowiedzi; zacznij od odpowiedzi."
 )
 
-_CITE = re.compile(r"\[(\d+(?:\s*[,;]\s*\d+)*)\]")
+_CITE = re.compile(r"\[((?:\d+|S)(?:\s*[,;]\s*(?:\d+|S))*)\]")
+_GAP_START = re.compile(r"^\W*(?:\d+[\.\)]\s*)?\W*brak\s+w\s+dokumentacji", re.IGNORECASE)
+_PREAMBLE = re.compile(
+    r"^(na podstawie|w oparciu o|zgodnie z|według|opierając się na)\b", re.IGNORECASE
+)
 _NO_ANSWER = re.compile(r"brak\s+w\s+dokumentacji", re.IGNORECASE)
 
 
@@ -298,6 +306,8 @@ def _validate_tuning(cfg: dict[str, Any]) -> None:
             raise SpecError("config", f"ollama.{k} must be a non-empty string or null")
     if not isinstance(cfg["route_structured"], bool):
         raise SpecError("config", "ollama.route_structured must be a boolean")
+    if not isinstance(cfg["normalize_answers"], bool):
+        raise SpecError("config", "ollama.normalize_answers must be a boolean")
     pats = cfg["structured_patterns"]
     if pats is not None:
         if not isinstance(pats, list):
@@ -1242,22 +1252,44 @@ class Engine:
             )
         finally:
             client.close()
+        answer_raw = answer
+        norm: dict[str, bool] = {"normalized": False}
+        if self.o["normalize_answers"] and not (
+            structured_result is not None and _numbers(answer)
+        ):
+            answer, norm = normalize_refusals(answer)
         cites = parse_citations(answer)
         cited = sorted({n for grp in cites for n in grp})
-        valid = all(1 <= n <= len(sources) for n in cited)
+        s_cited = cites_structured(answer)
+        n_doc = sum(1 for s in sources if s["n"] != "S")
+        valid = all(1 <= n <= n_doc for n in cited) and (
+            not s_cited or structured_result is not None
+        )
         no_answer = bool(_NO_ANSWER.search(answer))
         partial_gap, consistency_warning = _gap_consistency(answer, question)
-        uncited = uncited_sentences(answer)
+        partial_gap = partial_gap or bool(norm.get("partial_gap"))
+        uncited = uncited_sentences(answer, question)
+        structured_support = (
+            structured_result is not None
+            and bool(_numbers(answer))
+            and _numbers(answer)
+            <= _numbers(json.dumps(structured_result, ensure_ascii=False) + " " + question)
+        )
         grounded = (
             bool(hits)
             and valid
-            and (bool(cited) or no_answer)
+            and (bool(cited) or s_cited or structured_support or no_answer)
             and len(uncited) <= max(1, len(_sentences(answer)) // 4)
+        )
+        structured_backed = structured_result is not None and (
+            s_cited or structured_support
         )
         above = sum(1 for h in hits if h["score"] >= min_score)
         margin = float(self.o["confidence_margin"])
         if not grounded or (no_answer and not partial_gap):
             confidence = "low"
+        elif structured_backed:
+            confidence = "high"
         elif best >= min_score + margin and above >= 2:
             confidence = "high"
         elif best >= min_score:
@@ -1277,11 +1309,15 @@ class Engine:
             "confidence": confidence,
             "sources": sources,
             "cited": cited,
+            "cited_structured": s_cited,
             "citations_valid": valid,
             "uncited_sentences": uncited,
             "no_answer": no_answer,
             "partial_gap": partial_gap,
-            "full_refusal": no_answer and not partial_gap and not cited,
+            "full_refusal": no_answer and not partial_gap and not cited and not s_cited,
+            "refusal": no_answer and not partial_gap and not cited and not s_cited,
+            "answer_normalized": bool(norm.get("normalized")),
+            **({"answer_raw": answer_raw} if norm.get("normalized") else {}),
             "consistency_warning": consistency_warning,
             "context_truncated": truncated,
             "model": used_model,
@@ -1457,9 +1493,15 @@ def _public_hit(h: dict[str, Any], with_snippet: bool = False) -> dict[str, Any]
 
 def _number_sources(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
-    for i, h in enumerate(hits, start=1):
+    i = 0
+    for h in hits:
+        if h["kind"] == "structured":
+            label: int | str = "S"
+        else:
+            i += 1
+            label = i
         src = {
-            "n": i,
+            "n": label,
             "kind": h["kind"],
             "corpus": h["corpus"],
             "path": h["file"],
@@ -1508,7 +1550,13 @@ def _fit_context(
 
 def _user_prompt(question: str, hits: list[dict[str, Any]], max_chars: int) -> str:
     blocks = []
-    for i, h in enumerate(hits, start=1):
+    i = 0
+    for h in hits:
+        if h["kind"] == "structured":
+            label = "S"
+        else:
+            i += 1
+            label = str(i)
         where = f"{h['file']}" + (
             f", linie {h['line']}-{h['line_end']}"
             if h["line"] and h["line_end"]
@@ -1516,16 +1564,27 @@ def _user_prompt(question: str, hits: list[dict[str, Any]], max_chars: int) -> s
         )
         text = h["text"] if len(h["text"]) <= max_chars else h["text"][:max_chars] + "…"
         blocks.append(
-            f"[{i}] ({h['kind']}, {where}, nagłówek: {h['path'] or h['heading']}, status: {h['status'] or '-'})\n{text}"
+            f"[{label}] ({h['kind']}, {where}, nagłówek: {h['path'] or h['heading']}, status: {h['status'] or '-'})\n{text}"
         )
     return f"Pytanie: {question}\n\nŹródła:\n\n" + "\n\n".join(blocks)
 
 
 def parse_citations(answer: str) -> list[list[int]]:
-    return [
-        [int(x) for x in re.split(r"[,;]\s*", m.group(1))]
-        for m in _CITE.finditer(answer)
-    ]
+    """Numbered citations only; `[S]` (structured result) is reported by `cites_structured`."""
+    out = []
+    for m in _CITE.finditer(answer):
+        nums = [
+            int(x) for x in re.split(r"[,;]\s*", m.group(1)) if x.strip().isdigit()
+        ]
+        if nums:
+            out.append(nums)
+    return out
+
+
+def cites_structured(answer: str) -> bool:
+    return any(
+        "S" in re.split(r"\s*[,;]\s*", m.group(1).strip()) for m in _CITE.finditer(answer)
+    )
 
 
 def _sentences(answer: str) -> list[str]:
@@ -1533,14 +1592,87 @@ def _sentences(answer: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def uncited_sentences(answer: str) -> list[str]:
+def _clean(sentence: str) -> str:
+    """Strip list markers and markdown emphasis from a sentence."""
+    t = re.sub(r"^[\s>\-\*\u2022]*(?:\d+[\.\)]\s*)?", "", sentence)
+    return t.replace("**", "").replace("__", "").strip()
+
+
+def _stem(w: str) -> str:
+    w = w.lower()
+    return w[:5] if len(w) >= 5 else w
+
+
+def is_question_paraphrase(sentence: str, question: str) -> bool:
+    """A sentence that restates the question: >= 70% of its content tokens (stemmed to 5
+    letters, so Polish inflection matches) occur in the question AND it brings no new number or
+    identifier-like token."""
+    core = _clean(sentence)
+    toks = [w for w in _words(core) if len(w) >= 3]
+    if len(toks) < 3 or not question:
+        return False
+    qraw = {w.lower() for w in _words(question)}
+    for w in _words(core):
+        if any(c.isdigit() for c in w) and w.lower() not in qraw:
+            return False
+    ql = question.lower()
+    ident = re.findall(
+        r"[A-Za-z0-9]+(?:[_./\-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z]+|\b[A-Z]{3,}\b", core
+    )
+    if any(i.lower() not in ql for i in ident):
+        return False
+    qstems = {_stem(w) for w in _words(question) if len(w) >= 3}
+    overlap = sum(1 for w in toks if _stem(w) in qstems) / len(toks)
+    return overlap >= 0.7
+
+
+def is_preamble(sentence: str) -> bool:
+    """A heading/lead-in without a claim: ends with ':' or starts »Na podstawie źródeł…« and
+    carries no number."""
+    core = _clean(sentence)
+    if re.search(r"\d", re.sub(r"\[[^\]]*\]", "", core)):
+        return False
+    if core.endswith(":") and len(_words(core)) <= 14:
+        return True
+    return bool(_PREAMBLE.match(core)) and len(core) < 110
+
+
+def uncited_sentences(answer: str, question: str | None = None) -> list[str]:
     out = []
     for s in _sentences(answer):
         core = re.sub(r"^[\-\*\d\.\)\s]+", "", s)
         if len(core) < 25 or _NO_ANSWER.search(s) or _CITE.search(s):
             continue
+        if is_preamble(s) or (question and is_question_paraphrase(s, question)):
+            continue
         out.append(s[:160])
     return out
+
+
+def normalize_refusals(answer: str) -> tuple[str, dict[str, bool]]:
+    """Deterministic post-check for looped refusals. >= 2 sentences starting with »Brak w
+    dokumentacji« and no cited claim -> ONE line (the first); with cited claims the claims stay and
+    the gap lines collapse into a single trailing one. Idempotent (a normalized answer has one gap)."""
+    sents = _sentences(answer)
+    gaps = [s for s in sents if _GAP_START.match(_clean(s))]
+    if len(gaps) < 2:
+        return answer, {"normalized": False}
+    first = _clean(gaps[0])
+    claims = [s for s in sents if s not in gaps and _CITE.search(s)]
+    if not claims:
+        return first, {"normalized": True, "refusal": True, "partial_gap": False}
+    keep = [s for s in sents if s not in gaps]
+    return "\n".join(keep + [first]), {
+        "normalized": True,
+        "refusal": False,
+        "partial_gap": True,
+    }
+
+
+def _numbers(text: str) -> set[str]:
+    text = re.sub(r"(?m)^\s*(?:\d+[\.\)]|[-*\u2022])\s+", "", text)
+    text = re.sub(r"\[[^\]]*\]", "", text)
+    return set(re.findall(r"\d+", text))
 
 
 def _check_evidence(

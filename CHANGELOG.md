@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.1 — 2026-10-12
+
+Fixes for three open points from the 0.7.0 evaluation (20 / 24). Tool count unchanged (49);
+228 tests.
+
+- **Grounding.** `uncited_sentences(answer, question)` skips sentences that restate the question,
+  headings / lead-ins and `Brak w dokumentacji` lines. A routed answer was marked
+  `grounded=false, confidence=low` because the model repeated the question in numbered sentences.
+- **`[S]` citations.** The structured tool result is source `[S]` in the prompt and in `sources`
+  (`n: "S"`); `[S]` is valid only when a structured result exists; new field `cited_structured`.
+  Numbers that all occur in the structured result count as support; such an answer is `high`.
+- **Refusal normalization.** `ollama.normalize_answers` (default on) collapses looped
+  `Brak w dokumentacji` lines (one line for a pure refusal; cited claims stay with one trailing gap
+  line). New fields `refusal`, `answer_normalized`, `answer_raw`.
+- Prompt: cite `[S]`, do not restate the question.
+
 ## 0.7.0 — 2026-10-12
 
 Retrieval tuning for `docs_semantic_search` / `docs_ask`, driven by a 24-question evaluation on a

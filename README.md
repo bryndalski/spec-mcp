@@ -466,6 +466,35 @@ All of these are optional and neutral until configured (except the generator pro
   question and the "Brak w dokumentacji" sentence); treat them as a prompt to read the answer twice,
   not as a verdict.
 
+#### Grounding (0.7.1)
+
+`grounded`, `citations_valid` and `confidence` describe how well an answer is backed by its
+sources, not whether it is true. Since 0.7.1 the check ignores sentences that carry no claim:
+
+- a sentence that restates the question (>= 70% of its content tokens, stemmed to 5 letters, occur
+  in the question, and it adds no new number or identifier) is not an *uncited sentence*;
+- a heading or lead-in (ends with `:` or starts `Na podstawie ...`, no number) is not a claim;
+- the phrase `Brak w dokumentacji ...` is never counted as an uncited claim.
+
+When a structured tool answered the question (`route_structured`), its result is source `[S]`
+(the prompt labels it so, the other sources keep numbers 1..n). `[S]` is a valid reference only if
+a structured result exists. An answer whose numbers all occur in the structured result (or the
+question) counts as supported even without a citation; such an answer gets `confidence: high`.
+`cited_structured` reports whether the answer cited `[S]`.
+
+#### Refusals (0.7.1)
+
+Small models loop on refusals (three lines of `Brak w dokumentacji: ...`). With
+`ollama.normalize_answers` (default `true`) a deterministic post-check collapses them:
+
+- two or more sentences starting with `Brak w dokumentacji` and no cited claim -> the answer
+  becomes ONE line, the first one; `refusal: true`, `answer_normalized: true`, original in `answer_raw`;
+- with cited claims the claims stay and the gap lines collapse into one trailing line
+  (`partial_gap: true`, `answer_normalized: true`);
+- it is idempotent, and skipped when a structured result with numbers backs the answer.
+
+Set `normalize_answers: false` to see the raw model output.
+
 ### Non-destructive by design
 
 - Markdown is **never rewritten**. Writers (`req_upsert`, `flow_upsert`,
