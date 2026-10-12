@@ -63,6 +63,7 @@ OLLAMA_DEFAULTS: dict[str, Any] = {
     "rank": {"status_boost": {}, "kind_boost": {}},
     # Guaranteed slots per kind group (record|flow|requirement|doc) when the question names it.
     "reserve": {},
+    "reserve_window": 30,  # how deep in the ranking a reserved candidate may sit
     "route_terms": ["trasa", "endpoint", "route", "POST", "GET", "PATCH"],
     "flow_terms": ["flow", "krok", "proces"],
     "list_terms": [
@@ -133,7 +134,9 @@ SYSTEM_PROMPT = (
     "Odpowiadaj WYŁĄCZNIE na podstawie źródeł [n]. Każde twierdzenie z odwołaniem [n]. "
     "Nie zgaduj. Odpowiadaj po polsku, zwięźle.\n"
     "Odpowiedz na KAŻDĄ część pytania osobno. Dla części bez źródła napisz jedynie "
-    "»Brak w dokumentacji: <czego brakuje>«; NIE dopisuj tego zdania, jeśli odpowiedź jest kompletna.\n"
+    "»Brak w dokumentacji: <czego brakuje>«; NIE dopisuj tego zdania, jeśli odpowiedź jest kompletna. "
+    "Jeśli żadne źródło nie dotyczy pytania, napisz DOKŁADNIE jedno zdanie »Brak w dokumentacji: "
+    "<czego brakuje>« i nic więcej (bez list, bez powtórzeń).\n"
     "Jeśli źródła wprost stwierdzają brak (np. »0 trafień«, »nie istnieje«, »brak«, »bez wywołań«), "
     "odpowiedz tym faktem (»Nie — …«), nie odmawiaj; »brak w dokumentacji« jest tylko dla sytuacji, "
     "gdy źródła w ogóle nie dotyczą pytania.\n"
@@ -283,11 +286,11 @@ def _validate_tuning(cfg: dict[str, Any]) -> None:
         v = cfg[k]
         if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
             raise SpecError("config", f"ollama.{k} must be a list of non-empty strings")
-    for k in ("top_k_list", "max_context_chars"):
+    for k in ("top_k_list", "max_context_chars", "reserve_window"):
         if (
             not isinstance(cfg[k], int)
             or isinstance(cfg[k], bool)
-            or cfg[k] < (1 if k == "top_k_list" else 200)
+            or cfg[k] < (200 if k == "max_context_chars" else 1)
         ):
             raise SpecError("config", f"ollama.{k} must be a positive integer")
     for k in ("system_prompt", "system_prompt_file"):
@@ -972,7 +975,11 @@ class Engine:
         for group, slots in sorted((self.o.get("reserve") or {}).items()):
             if slots <= 0 or not self._question_names(query, group):
                 continue
-            window = [t for t in scored[:30] if _KIND_TO_GROUP.get(items[t[2]]["kind"]) == group]
+            window = [
+                t
+                for t in scored[: int(self.o["reserve_window"])]
+                if _KIND_TO_GROUP.get(items[t[2]]["kind"]) == group
+            ]
             have = sum(1 for t in top if _KIND_TO_GROUP.get(items[t[2]]["kind"]) == group)
             for cand in window:
                 if have >= slots:
@@ -1274,6 +1281,7 @@ class Engine:
             "uncited_sentences": uncited,
             "no_answer": no_answer,
             "partial_gap": partial_gap,
+            "full_refusal": no_answer and not partial_gap and not cited,
             "consistency_warning": consistency_warning,
             "context_truncated": truncated,
             "model": used_model,

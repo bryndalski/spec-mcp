@@ -425,6 +425,7 @@ All of these are optional and neutral until configured (except the generator pro
   "rank":    { "status_boost": { "current": 1.0, "draft": 0.85, "unknown": 0.9 },
                "kind_boost":   { "record": 1.1, "flow": 1.05 } },
   "reserve": { "record": 2, "flow": 1 },        // guaranteed slots when the question names them
+  "reserve_window": 400,                         // how deep in the ranking a candidate may sit (default 30)
   "route_terms": ["trasa", "endpoint", "route", "POST", "GET", "PATCH"],
   "flow_terms":  ["flow", "krok", "proces"],
   "list_terms":  ["które", "jakie", "lista", "wszystkie", "ile", "co nadal", "wymień"],
@@ -440,10 +441,18 @@ All of these are optional and neutral until configured (except the generator pro
   to documents without a front-matter status only when `docs.require_front_matter` is true (otherwise
   such documents count as `current`). `status_boost` applies to documents only (the `status` of a
   requirement or record is domain data, not a document status); `kind_boost` applies to every kind.
+- **Measure before you penalise drafts.** On a real 4 182-item corpus (20 answerable questions) the
+  fraction of questions with an expected source in the top 3 was 14/20 without tuning and fell to 13, 12
+  and 11 with `status_boost.draft` of 0.97, 0.95 and 0.85: several `draft` documents (legal, finance, KB)
+  were the only place holding a fact, so any penalty pushed them under longer `current` documents.
+  `kind_boost.record: 1.1` and reserved slots cost nothing (14/20) and gave one more hit in the top-K
+  (16/20). Use `status_boost` when drafts are duplicates of reviewed documents, not when they are sources.
 - **Reserved slots** trigger on the question text (`route_terms` -> `record`, `flow_terms` -> `flow`).
   ALL-CAPS terms are case-sensitive whole words, other single words match by stem
-  (`trasa` ~ `trasy`, `trasach`), terms with spaces match as substrings. The candidate must already be
-  in the top 30 of the ranking.
+  (`trasa` ~ `trasy`, `trasach`), terms with spaces match as substrings. A candidate must sit inside
+  `reserve_window` (default 30) of the ranking; when records are written in another language than the
+  question (English route fields, Polish question) they rank far below 30, so widen the window to the
+  collection size.
 - **Structured routing** exists because embeddings do not carry fields such as `status`: "which
   requirements are not implemented?" or "how many routes?" are answered by a record tool, not by
   similarity. Patterns are `{pattern, tool, arguments, execute}`; defaults cover not-implemented /

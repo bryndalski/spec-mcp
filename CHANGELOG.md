@@ -6,13 +6,33 @@ Retrieval tuning for `docs_semantic_search` / `docs_ask`, driven by a 24-questio
 real 4 182-item corpus. Every new key is optional; without configuration only the default
 generator prompt changed (see below). Tool count unchanged (49).
 
+
+Measured on the Duotio corpus (4 182 embedded items, 24 questions, `mistral-small3.2:24b`;
+n is small, run-to-run noise is about +-2 questions):
+
+| Configuration | Correct (automatic regex check) | Median latency |
+|---|---|---|
+| 0.6.0, no tuning | 18 / 24 | 28.8 s |
+| 0.7.0, all tuning (status boost 0.85, record 1.1, flow 1.05, reserve 2+1, window 30) | 20 / 24 | 47.2 s |
+| 0.7.0, final (record 1.1, reserve 1+1, window 400, structured routing) | 20 / 23 + 1 timeout; 22 / 24 after re-running the 3 flipped questions | 43.8 s |
+
+Retrieval-only ablation (expected source in top 3 / anywhere in top-K, 20 answerable questions):
+no tuning 14 / 15; `status_boost.draft` 0.97 -> 13 / 15, 0.95 -> 12 / 15, 0.85 -> 11 / 14 (drafts were the
+only source for several facts); `kind_boost.record 1.1` 14 / 16; record 1.1 + reserve 1+1 window 400
+14 / 16. Latency grows because list questions send up to 12 sources. Two of the remaining
+"incorrect" answers were correct in substance but missed the evaluator's regex (an answer that
+restates the question, an answer without a function name).
+
 - **`ollama.rank`**: `status_boost` (per document status, `unknown` = no front-matter status when
   `docs.require_front_matter` is on) and `kind_boost` (`record|flow|requirement|doc`) multiply the
   hybrid score for ORDERING only (`rank_score`). `min_score` and the reported `score` always use the
   score before boosting, so tuning the order never changes the refusal gate.
 - **`ollama.reserve`** + `route_terms` / `flow_terms`: when the question names routes (or flows),
-  the best `record` (flow-step) hits found in the top 30 are guaranteed slots in the result
-  (`reserved: true`), replacing the weakest other hit.
+  the best `record` (flow-step) hits found inside `reserve_window` (default 30) are guaranteed
+  slots in the result (`reserved: true`), replacing the weakest other hit.
+- **`reserve_window`** (default 30): how deep in the ranking a reserved candidate may sit. Records
+  written in another language than the question rank far below 30; 400 reached them on the
+  evaluation corpus.
 - **Adaptive `top_k`**: list-type questions (`list_terms`) use `max(top_k, min(top_k_list, 14))`;
   `max_context_chars` (default 14000) drops the weakest sources, never reserved or structured ones
   (`context_truncated`).
@@ -20,7 +40,7 @@ generator prompt changed (see below). Tool count unchanged (49).
   every part of the question, append "Brak w dokumentacji: …" only for parts without a source, state
   explicit absences ("0 trafień", "nie istnieje") as a fact instead of refusing, and never list
   things the sources describe as existing-but-uncalled/disabled as working.
-- **Post-check**: `partial_gap` (content AND a "Brak w dokumentacji" line) and
+- **Post-check**: `full_refusal` (nothing but "Brak w dokumentacji" lines), `partial_gap` (content AND a "Brak w dokumentacji" line) and
   `consistency_warning` (the gap line is about the same entity as the question). A partial gap no
   longer forces `confidence: low`.
 - **Structured routing**: `route_hint: "structured"` + `suggested_tool` (`req_list`,

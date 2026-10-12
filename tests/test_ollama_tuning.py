@@ -61,6 +61,7 @@ def test_rank_section_merges_per_key(project: Path):
         {"reserve": {"record": -1}},
         {"route_terms": [""]},
         {"top_k_list": 0},
+        {"reserve_window": 0},
         {"max_context_chars": 10},
         {"route_structured": "yes"},
         {"structured_patterns": [{"pattern": "(", "tool": "req_list"}]},
@@ -172,6 +173,7 @@ def test_default_prompt_carries_the_new_rules():
     for needle in (
         "KAŻDĄ część",
         "Brak w dokumentacji:",
+        "DOKŁADNIE jedno zdanie",
         "0 trafień",
         "bez wywołań",
         "[n]",
@@ -509,3 +511,26 @@ def test_not_executable_pattern_stays_a_hint_even_when_routing_is_on(rag):
 
 def test_tool_registry_is_unchanged_at_49():
     assert len(server.mcp._tool_manager._tools) == 49  # noqa: SLF001
+
+
+def test_reserve_window_decides_how_deep_a_record_may_sit(rag):
+    _, root, set_cfg = rag
+    _routes(root, ROUTE_ROWS)
+    # a window of 1 only sees the best hit overall (a document) -> nothing to reserve
+    set_cfg(corpora=["docs", "records:routes"], reserve={"record": 1}, reserve_window=1)
+    server.docs_reindex()
+    q = "api gateway domains hosting endpoint"
+    assert server.docs_semantic_search(q, limit=1)["hits"][0]["kind"] == "doc"
+    set_cfg(corpora=["docs", "records:routes"], reserve={"record": 1}, reserve_window=500)
+    assert server.docs_semantic_search(q, limit=1)["hits"][0]["kind"] == "record"
+
+
+def test_full_refusal_is_a_distinct_flag(rag):
+    fake, _, _ = rag
+    server.docs_reindex()
+    fake.reply = "1. Brak w dokumentacji: stawki. 2. Brak w dokumentacji: lokalizacji stawki."
+    out = server.docs_ask("how does organization activation work two-sided owner publishes schedule")
+    assert out["full_refusal"] is True and out["partial_gap"] is False
+    fake.reply = "Aktywacja jest dwustronna [1]. Brak w dokumentacji: szczegółów wdrożenia."
+    out = server.docs_ask("how does organization activation work two-sided owner publishes schedule")
+    assert out["full_refusal"] is False and out["partial_gap"] is True
